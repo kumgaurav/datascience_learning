@@ -1,0 +1,19 @@
+name: stocks
+channels:
+  - apple
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - streamlit=1.28.1
+  - pandas=2.1.3
+  - numpy=1.25.2
+  - plotly=5.17.0
+  - scikit-learn=1.3.2
+  - mysql-connector-python=8.2.0
+  - pymysql=1.1.0
+  - sqlalchemy=2.0.23
+  - configparser
+  - pip
+  - pip:
+    - deap==1.4.1
