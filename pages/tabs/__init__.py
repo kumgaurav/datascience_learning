@@ -13,6 +13,7 @@ from .macd_tab import MACDTab
 from .volume_obv_tab import VolumeOBVTab
 from .atr_tab import ATRTab
 from .best_performers_tab import BestPerformersTab
+from .consistent_performers_tab import ConsistentPerformersTab
 from .volatile_stocks_tab import VolatileStocksTab
 from .earnings_stocks_tab import EarningsStocksTab
 
@@ -26,6 +27,7 @@ __all__ = [
     'VolumeOBVTab',
     'ATRTab',
     'BestPerformersTab',
+    'ConsistentPerformersTab',
     'VolatileStocksTab',
     'EarningsStocksTab'
 ] 

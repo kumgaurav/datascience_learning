@@ -6,12 +6,12 @@ import numpy as np
 from stock_analysis import calculate_rsi
 from config_manager import ConfigManager, DatabaseManager
 
-# Page configuration
-st.set_page_config(
-    page_title="Stock Debug App",
-    page_icon="📈",
-    layout="wide"
-)
+# Page configuration - COMMENTED OUT (using app_refactored.py as main)
+# st.set_page_config(
+#     page_title="Stock Debug App",
+#     page_icon="📈",
+#     layout="wide"
+# )
 
 # Initialize configuration and database managers
 @st.cache_resource

@@ -35,8 +35,8 @@ class HomePage:
         st.title("📈 Stock Analysis Dashboard")
         st.markdown("---")
         
-        # Navigation buttons
-        col1, col2, col3 = st.columns([1, 1, 1])
+        # Navigation buttons and cache control
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
         
         with col1:
             if st.button("🏆 Top 25 Performers", type="secondary", use_container_width=True, key="home_top_performers"):
@@ -49,6 +49,11 @@ class HomePage:
         with col3:
             if st.button("📅 Earnings Calendar", type="secondary", use_container_width=True, key="home_earnings"):
                 st.switch_page("pages/earnings_page.py")
+        
+        with col4:
+            if st.button("🔄 Clear Cache", help="Refresh all cached data", key="home_clear_cache"):
+                st.cache_data.clear()
+                st.rerun()
         
         st.markdown("---")
         
@@ -88,7 +93,7 @@ class HomePage:
         logger.info(f"Loading stock change tracker data... Page: {page}, Search: '{search}'")
         
         try:
-            # Load data from database
+            # Load data from database (cached)
             df = self.db_manager.get_stock_change_tracker(page, page_size, search)
             
             if df.empty:

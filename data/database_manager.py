@@ -268,34 +268,29 @@ class DatabaseManager:
             return False
     
     def get_connection_status(self) -> Dict[str, Any]:
-        """
-        Get database connection status information
-        
-        Returns:
-            Dictionary with connection status
-        """
+        """Get current database connection status"""
         try:
             connection = self._get_connection()
-            
             if connection and connection.is_connected():
-                db_info = connection.get_server_info()
                 connection.close()
-                
-                return {
-                    'status': 'Connected',
-                    'server_version': db_info,
-                    'database': self.config['mysql'].get('database', 'stocksdb'),
-                    'host': self.config['mysql'].get('url', 'localhost'),
-                    'port': self.config['mysql'].get('port', '3306')
-                }
+                return {'status': 'Connected', 'timestamp': datetime.now()}
             else:
-                return {
-                    'status': 'Disconnected',
-                    'error': 'Could not establish connection'
-                }
-                
+                return {'status': 'Disconnected', 'error': 'Failed to establish connection'}
         except Exception as e:
-            return {
-                'status': 'Error',
-                'error': str(e)
-            } 
+            return {'status': 'Error', 'error': str(e)}
+    
+    def get_minimum_price_filter(self) -> float:
+        """
+        Get the minimum price filter from configuration
+        
+        Returns:
+            float: Minimum price threshold (default: 1.0)
+        """
+        try:
+            if 'stocks' in self.config and 'minimum_price_filter' in self.config['stocks']:
+                return self.config['stocks'].getfloat('minimum_price_filter', 1.0)
+            else:
+                return 1.0  # Default to $1.00 if not configured
+        except Exception as e:
+            logger.warning(f"Error reading minimum price filter from config: {e}, using default of 1.0")
+            return 1.0 

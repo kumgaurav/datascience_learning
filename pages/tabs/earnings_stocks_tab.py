@@ -22,14 +22,18 @@ class EarningsStocksTab:
         self.db_manager = db_manager
         self.tech_indicators = TechnicalIndicators()
     
-    def render(self, symbol: str, stock_data: pd.DataFrame):
+    def render(self, symbol: str, stock_data: pd.DataFrame, selected_symbols: list = None, chart_columns: int = 1, pre_calculated_data: pd.DataFrame = None):
         logger.info(f"Rendering Earnings Stocks tab for symbol: {symbol}")
         
         try:
             # Add loading indicator
             with st.spinner("Loading earnings data..."):
-                # Get stocks with earnings in next 4 weeks
-                earnings_stocks = self._get_earnings_stocks()
+                # Get stocks with earnings in next 4 weeks (use pre-calculated if available)
+                if pre_calculated_data is not None and not pre_calculated_data.empty:
+                    logger.info("Using pre-calculated earnings data")
+                    earnings_stocks = pre_calculated_data
+                else:
+                    earnings_stocks = self._get_earnings_stocks()
             
             if earnings_stocks.empty:
                 st.warning("📅 No stocks with earnings data found")
@@ -46,8 +50,17 @@ class EarningsStocksTab:
                 """)
                 return
             
-            # Show success message
-            st.success(f"✅ Found {len(earnings_stocks)} stocks with upcoming earnings")
+            # Filter by selected symbols if provided
+            if selected_symbols:
+                filtered_earnings = earnings_stocks[earnings_stocks['symbol'].isin(selected_symbols)]
+                if filtered_earnings.empty:
+                    st.warning(f"No earnings data available for selected symbols: {', '.join(selected_symbols)}")
+                    return
+                earnings_stocks = filtered_earnings
+                st.info(f"📊 Showing analysis for {len(selected_symbols)} selected symbols")
+            else:
+                # Show success message
+                st.success(f"✅ Found {len(earnings_stocks)} stocks with upcoming earnings")
             
             # Display earnings calendar
             self._display_earnings_calendar(earnings_stocks)
@@ -55,8 +68,13 @@ class EarningsStocksTab:
             # Display volatility chart
             self._display_earnings_volatility_chart(earnings_stocks)
             
-            # Display individual stock price charts
-            self._display_stock_price_grid(earnings_stocks)
+            # Display individual stock charts if symbols are selected
+            if selected_symbols:
+                st.markdown("---")
+                self._display_individual_earnings_charts(selected_symbols, chart_columns)
+            else:
+                # Display default stock price grid
+                self._display_stock_price_grid(earnings_stocks)
             
             # Display analysis table
             self._display_earnings_table(earnings_stocks)
@@ -84,6 +102,9 @@ class EarningsStocksTab:
                 logger.warning("Earnings table not found, using fallback method")
                 return self._get_fallback_earnings_data()
             
+            # Include minimum price filter from config
+            min_price = self.db_manager.get_minimum_price_filter()
+            
             # Query to get stocks with earnings in next 4 weeks and their price data
             query = """
             SELECT DISTINCT
@@ -102,6 +123,7 @@ class EarningsStocksTab:
             AND p.close IS NOT NULL AND p.close != '' AND p.close != '0'
             AND p.high IS NOT NULL AND p.high != '' AND p.high != '0'
             AND p.low IS NOT NULL AND p.low != '' AND p.low != '0'
+            AND CAST(p.close AS DECIMAL(10,2)) >= %(min_price)s
             AND (s.is_active = 1 OR s.is_active IS NULL)
             ORDER BY p.symbol, p.date
             """
@@ -110,7 +132,8 @@ class EarningsStocksTab:
                 'start_date': start_date,
                 'end_date': end_date,
                 'earnings_start': end_date,
-                'earnings_end': earnings_end_date
+                'earnings_end': earnings_end_date,
+                'min_price': min_price
             })
             
             if all_data.empty:
@@ -253,6 +276,9 @@ class EarningsStocksTab:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=30)
             
+            # Include minimum price filter from config
+            min_price = self.db_manager.get_minimum_price_filter()
+            
             query = """
             SELECT 
                 symbol, 
@@ -266,12 +292,14 @@ class EarningsStocksTab:
             AND close IS NOT NULL AND close != '' AND close != '0'
             AND high IS NOT NULL AND high != '' AND high != '0'
             AND low IS NOT NULL AND low != '' AND low != '0'
+            AND CAST(close AS DECIMAL(10,2)) >= %(min_price)s
             ORDER BY symbol, date
             """
             
             data = self.db_manager.execute_query(query, {
                 'start_date': start_date,
-                'end_date': end_date
+                'end_date': end_date,
+                'min_price': min_price
             })
             
             if data.empty:
@@ -553,16 +581,20 @@ class EarningsStocksTab:
             # Create placeholders for symbols
             symbol_placeholders = ', '.join(['%s'] * len(earnings_symbols))
             
+            # Include minimum price filter from config
+            min_price = self.db_manager.get_minimum_price_filter()
+            
             query = f"""
             SELECT symbol, date, close, high, low
             FROM stocksdb.stocksinfp
             WHERE symbol IN ({symbol_placeholders})
             AND date >= %s AND date <= %s
             AND close IS NOT NULL AND close != '' AND close != '0'
+            AND CAST(close AS DECIMAL(10,2)) >= %s
             ORDER BY symbol, date
             """
             
-            params = earnings_symbols + [start_date, end_date]
+            params = earnings_symbols + [start_date, end_date, min_price]
             price_data = self.db_manager.execute_query(query, params)
             
             if price_data.empty:
@@ -720,44 +752,82 @@ class EarningsStocksTab:
         ax.set_yticks([])
     
     def _create_earnings_stock_plot(self, ax, stock_data, symbol):
-        """Create individual stock plot with earnings information"""
+        """Create individual stock plot for earnings candidate"""
         try:
-            # Get plot data
+            # Get earnings info
+            earnings_date = stock_data['earnings_date'].iloc[0]
+            days_to_earnings = stock_data['days_to_earnings'].iloc[0]
+            volatility_score = stock_data['volatility_score'].iloc[0]
+            recent_momentum = stock_data['recent_momentum'].iloc[0]
+            
+            # Get price data
             dates = stock_data['Date']
             prices = stock_data['Close']
             
-            # Get earnings info (should be same for all rows)
-            earnings_date = stock_data.iloc[0]['earnings_date']
-            days_to_earnings = stock_data.iloc[0]['days_to_earnings']
-            volatility_score = stock_data.iloc[0]['volatility_score']
-            recent_momentum = stock_data.iloc[0]['recent_momentum']
+            # Calculate return
+            first_price = prices.iloc[0]
+            last_price = prices.iloc[-1]
+            total_return = ((last_price - first_price) / first_price) * 100
             
-            # Plot the price line
-            ax.plot(dates, prices, marker='o', linewidth=2, markersize=4, color='blue', alpha=0.8)
+            # Calculate max/min for display
+            max_price = prices.max()
+            min_price = prices.min()
             
-            # Add price annotations for key points
-            # First and last prices
-            ax.annotate(f'${prices.iloc[0]:.2f}', 
-                       xy=(dates.iloc[0], prices.iloc[0]), 
-                       xytext=(5, 5), textcoords='offset points',
-                       fontsize=8, color='green')
+            # Determine color for overall return
+            return_color = 'green' if total_return >= 0 else 'red'
+            momentum_color = 'green' if recent_momentum >= 0 else 'red'
             
-            ax.annotate(f'${prices.iloc[-1]:.2f}', 
-                       xy=(dates.iloc[-1], prices.iloc[-1]), 
-                       xytext=(5, 5), textcoords='offset points',
-                       fontsize=8, color='red')
+            # Plot the price line with blue color (back to original)
+            ax.plot(dates, prices, marker='o', linestyle='-', linewidth=2, 
+                   color='blue', markersize=3, label='Close Price')
             
-            # Customize the plot
-            max_price = stock_data['max_close'].iloc[0]
-            min_price = stock_data['min_close'].iloc[0]
+            # Annotate price values with color based on price change
+            prices_list = prices.tolist()
+            dates_list = dates.tolist()
+            
+            for i, (date, price) in enumerate(zip(dates_list, prices_list)):
+                # Determine color based on price change from previous point
+                if i == 0:
+                    # First point - use neutral color
+                    text_color = "black"
+                else:
+                    # Compare with previous price
+                    prev_price = prices_list[i-1]
+                    if price > prev_price:
+                        # Price increased - green
+                        text_color = "green"
+                    elif price < prev_price:
+                        # Price decreased - red
+                        text_color = "red"
+                    else:
+                        # Price unchanged - neutral
+                        text_color = "black"
+                
+                ax.text(date, price, f'${price:.2f}', fontsize=8, fontweight='bold',
+                       ha='center', va='bottom', color=text_color,
+                       bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
             
             # Format earnings date
-            earnings_date_str = earnings_date.strftime('%m/%d')
+            earnings_str = earnings_date.strftime('%m/%d') if pd.notna(earnings_date) else 'N/A'
             
-            # Title with earnings info
-            momentum_symbol = "📈" if recent_momentum > 0 else "📉" if recent_momentum < 0 else "➡️"
-            title = f'{symbol} | Earnings: {earnings_date_str} ({days_to_earnings}d)\nVol: {volatility_score:.1f} | {momentum_symbol} {recent_momentum:+.1f}%'
-            ax.set_title(title, fontsize=10, fontweight='bold')
+            # Set title with bold symbol and key metrics (black text, no return/momentum)
+            ax.set_title(f'**{symbol}** | ERD: {earnings_str}, Days: {days_to_earnings}\n'
+                        f'VS: {volatility_score:.2f}, Max: ${max_price:.2f}, Min: ${min_price:.2f}\n'
+                        f'Return: ',
+                        fontsize=9, fontweight='bold', pad=10)
+            
+            # Add colored return and momentum values closer to the text
+            ax.text(0.12, 0.92, f"{total_return:+.1f}%", 
+                    transform=ax.transAxes, fontsize=9, fontweight='bold',
+                    color=return_color, ha='left', va='top')
+            
+            ax.text(0.20, 0.92, f", Momentum: {recent_momentum:+.1f}%", 
+                    transform=ax.transAxes, fontsize=9, fontweight='bold',
+                    color=momentum_color, ha='left', va='top')
+            
+            # Set axis labels with bold text
+            ax.set_xlabel('Date', fontsize=9, fontweight='bold')
+            ax.set_ylabel('Price ($)', fontsize=9, fontweight='bold')
             
             # Format x-axis (dates)
             ax.tick_params(axis='x', rotation=45, labelsize=8)
@@ -897,4 +967,258 @@ class EarningsStocksTab:
         - Monitor recent momentum for trend direction
         - Be aware of earnings date for position timing
         - Use stop-losses due to increased volatility
-        """) 
+        """)
+    
+    def _display_individual_earnings_charts(self, selected_symbols: list, chart_columns: int):
+        """Display individual earnings charts for selected symbols"""
+        st.subheader("📈 Individual Earnings Stock Charts")
+        st.markdown("**Pre-Earnings Price Movement Analysis (Last 4 Weeks)**")
+        
+        try:
+            # Get price data for selected symbols
+            price_data = self._get_earnings_price_data_for_symbols(selected_symbols)
+            
+            if price_data.empty:
+                st.warning("No price data available for selected symbols")
+                return
+            
+            # Create individual charts
+            self._create_individual_earnings_charts(price_data, selected_symbols, chart_columns)
+            
+        except Exception as e:
+            logger.error(f"Error displaying individual earnings charts: {e}")
+            st.error("Failed to load individual earnings stock charts")
+    
+    def _get_earnings_price_data_for_symbols(self, symbols: list) -> pd.DataFrame:
+        """Get price data for selected symbols over last 4 weeks for earnings analysis"""
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=28)  # Last 4 weeks
+            
+            # Format symbols for SQL IN clause
+            symbols_str = "', '".join(symbols)
+            
+            # Include minimum price filter from config
+            min_price = self.db_manager.get_minimum_price_filter()
+            
+            query = f"""
+            SELECT p.symbol, date, close, high, low, volume
+            FROM stocksinfp as p
+            LEFT JOIN stock_change_tracker as s ON s.symbol = p.symbol
+            WHERE p.symbol IN ('{symbols_str}')
+            AND date >= %s AND date <= %s
+            AND close IS NOT NULL AND close != '' AND close != '0'
+            AND CAST(close AS DECIMAL(10,2)) >= %s
+            AND s.is_active = 1
+            ORDER BY symbol, date
+            """
+            
+            data = self.db_manager.execute_query(query, (start_date, end_date, min_price))
+            
+            if data.empty:
+                return pd.DataFrame()
+            
+            # Convert data types
+            data['date'] = pd.to_datetime(data['date'])
+            for col in ['close', 'high', 'low', 'volume']:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+            
+            # Clean data
+            data = data.dropna(subset=['close'])
+            data = data[data['close'] > 0]
+            
+            return data
+            
+        except Exception as e:
+            logger.error(f"Error getting earnings price data: {e}")
+            return pd.DataFrame()
+    
+    def _create_individual_earnings_charts(self, price_data: pd.DataFrame, symbols: list, ncols: int):
+        """Create individual matplotlib charts for each earnings symbol"""
+        try:
+            # Calculate number of rows needed
+            nrows = (len(symbols) + ncols - 1) // ncols
+            
+            # Create figure with proper sizing (your original style)
+            fig, axes = plt.subplots(
+                nrows=nrows,
+                ncols=ncols,
+                figsize=(18, 5 * nrows),
+                sharex=False,  # Disable shared x-axis so each plot gets its own label
+                sharey=False  # Disable shared y-axis
+            )
+            
+            # Set style (your original style)
+            plt.style.use('seaborn-v0_8')
+            
+            # Handle single subplot case
+            if nrows == 1 and ncols == 1:
+                axes = [axes]
+            elif nrows == 1 or ncols == 1:
+                axes = axes.flatten()
+            else:
+                axes = axes.flatten()
+            
+            # Create chart for each symbol
+            for idx, symbol in enumerate(symbols):
+                if idx < len(axes):
+                    ax = axes[idx]
+                    symbol_data = price_data[price_data['symbol'] == symbol].copy()
+                    
+                    if not symbol_data.empty:
+                        self._create_individual_earnings_chart(ax, symbol_data, symbol)
+                    else:
+                        self._handle_empty_earnings_chart(ax, symbol)
+            
+            # Hide unused subplots
+            for idx in range(len(symbols), len(axes)):
+                axes[idx].axis('off')
+            
+            # Apply tight layout to ensure labels don't overlap (your original style)
+            plt.tight_layout()
+            
+            # Display chart
+            st.pyplot(fig, clear_figure=True)
+            
+        except Exception as e:
+            logger.error(f"Error creating individual earnings charts: {e}")
+            st.error("Failed to create individual earnings stock charts")
+    
+    def _create_individual_earnings_chart(self, ax, symbol_data, symbol):
+        """Create chart for individual earnings stock"""
+        try:
+            symbol_data = symbol_data.sort_values('date')
+            
+            # Ensure numeric conversion
+            symbol_data['close'] = pd.to_numeric(symbol_data['close'], errors='coerce')
+            
+            # Get values for the title
+            max_close = symbol_data['close'].max()
+            min_close = symbol_data['close'].min()
+            first_price = symbol_data.iloc[0]['close']
+            last_price = symbol_data.iloc[-1]['close']
+            total_return = ((last_price - first_price) / first_price) * 100
+            
+            # Get earnings info if available
+            earnings_info = self._get_earnings_info_for_symbol(symbol)
+            earnings_date_str = "N/A"
+            if earnings_info:
+                earnings_date = earnings_info.get('earnings_date')
+                if earnings_date:
+                    earnings_date_str = earnings_date.strftime('%m/%d')
+            
+            # Determine color for overall return
+            return_color = 'green' if total_return >= 0 else 'red'
+            
+            # Plot Close as a line graph with markers (back to blue)
+            ax.plot(
+                symbol_data['date'],
+                symbol_data['close'],
+                marker='o',
+                linestyle='-',
+                label="Close Price",
+                linewidth=2,
+                color="blue"
+            )
+            
+            # Annotate each Close value with color based on price change
+            prices = symbol_data['close'].tolist()
+            dates = symbol_data['date'].tolist()
+            
+            for i, (date, close) in enumerate(zip(dates, prices)):
+                # Determine color based on price change from previous point
+                if i == 0:
+                    # First point - use neutral color
+                    text_color = "black"
+                else:
+                    # Compare with previous price
+                    prev_price = prices[i-1]
+                    if close > prev_price:
+                        # Price increased - green
+                        text_color = "green"
+                    elif close < prev_price:
+                        # Price decreased - red
+                        text_color = "red"
+                    else:
+                        # Price unchanged - neutral
+                        text_color = "black"
+                
+                ax.text(
+                    date, close, f"${close:.2f}",
+                    fontsize=10,
+                    fontweight='bold',
+                    ha="right",
+                    va="bottom",
+                    color=text_color,
+                    bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3')
+                )
+            
+            # Set title with bold symbol and earnings date (black text, no return)
+            ax.set_title(
+                f"**{symbol}** | Max: ${max_close:.2f}, Min: ${min_close:.2f}, ERD: {earnings_date_str}, Return: ",
+                fontsize=12,
+                fontweight='bold',
+                pad=10
+            )
+            
+            # Add colored return percentage right after "Return: "
+            ax.text(0.78, 1.02, f"{total_return:+.1f}%", 
+                    transform=ax.transAxes, fontsize=12, fontweight='bold',
+                    color=return_color, ha='left', va='bottom')
+            
+            # Set individual x-axis label for each chart
+            ax.set_xlabel("Date", fontsize=10, fontweight='bold')
+            
+            # Set y-axis label
+            ax.set_ylabel("Close Price ($)", fontsize=10, fontweight='bold')
+            
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper left')
+            
+            # Configure x-axis for proper date formatting
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+            
+            # Ensure date labels are readable
+            ax.tick_params(axis='x', rotation=45)
+            
+        except Exception as e:
+            logger.error(f"Error creating earnings chart for {symbol}: {e}")
+            self._handle_empty_earnings_chart(ax, symbol)
+    
+    def _get_earnings_info_for_symbol(self, symbol: str) -> dict:
+        """Get earnings information for a specific symbol"""
+        try:
+            query = """
+            SELECT earnings_date
+            FROM stocks_earnings
+            WHERE symbol = %s
+            AND earnings_date >= CURDATE()
+            ORDER BY earnings_date ASC
+            LIMIT 1
+            """
+            
+            result = self.db_manager.execute_query(query, (symbol,))
+            
+            if not result.empty:
+                earnings_date = pd.to_datetime(result.iloc[0]['earnings_date'])
+                days_to_earnings = (earnings_date - datetime.now()).days
+                return {
+                    'earnings_date': earnings_date,
+                    'days_to_earnings': days_to_earnings
+                }
+            
+            return {}
+            
+        except Exception as e:
+            logger.error(f"Error getting earnings info for {symbol}: {e}")
+            return {}
+    
+    def _handle_empty_earnings_chart(self, ax, symbol):
+        """Handle case where no data is available for an earnings symbol"""
+        ax.text(0.5, 0.5, f'No data available\nfor {symbol}', 
+                ha='center', va='center', transform=ax.transAxes,
+                fontsize=12, color='gray')
+        ax.set_title(f'{symbol} - No Data (Earnings)', fontsize=12, fontweight='bold')
+        ax.set_xticks([])
+        ax.set_yticks([]) 

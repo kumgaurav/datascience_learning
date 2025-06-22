@@ -7,13 +7,13 @@ from stock_analysis import calculate_rsi, generate_trading_signals, NeuroEvoluti
 from config_manager import ConfigManager, DatabaseManager
 from logger_config import logger
 
-# Page configuration
-st.set_page_config(
-    page_title="Stock Change Tracker",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Page configuration - COMMENTED OUT (using app_refactored.py as main)
+# st.set_page_config(
+#     page_title="Stock Change Tracker",
+#     page_icon="📈",
+#     layout="wide",
+#     initial_sidebar_state="expanded"
+# )
 
 # Custom CSS for styling
 st.markdown("""

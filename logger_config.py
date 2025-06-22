@@ -2,8 +2,16 @@ import logging
 import os
 from datetime import datetime
 
+# Global flag to prevent duplicate logger setup
+_logger_initialized = False
+
 def setup_logger():
     """Set up comprehensive logging configuration"""
+    global _logger_initialized
+    
+    # Prevent duplicate initialization
+    if _logger_initialized:
+        return logging.getLogger('StockApp')
     
     # Create logs directory if it doesn't exist
     log_dir = "logs"
@@ -30,7 +38,8 @@ def setup_logger():
     logger.info(f"Log file: {log_filename}")
     logger.info("="*50)
     
+    _logger_initialized = True
     return logger
 
-# Create global logger instance
+# Create global logger instance only once
 logger = setup_logger() 

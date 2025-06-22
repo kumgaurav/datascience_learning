@@ -22,12 +22,7 @@ from pages.tabs import EarningsStocksTab
 setup_logger()
 logger = logging.getLogger('StockApp')
 
-# Page configuration
-st.set_page_config(
-    page_title="Earnings Calendar",
-    page_icon="📅",
-    layout="wide"
-)
+# Note: Page configuration is handled by the main app (app_refactored.py)
 
 @st.cache_resource
 def get_database_manager():
@@ -37,6 +32,24 @@ def get_database_manager():
     except Exception as e:
         st.error(f"Failed to initialize database: {e}")
         st.stop()
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_cached_earnings_stocks_data():
+    """Get cached earnings stocks data to avoid repeated DB queries"""
+    try:
+        # Create a fresh database manager for this cached call
+        db_manager = DatabaseManager()
+        logger.info("[CACHED CALL] Fetching earnings stocks data")
+        
+        from pages.tabs import EarningsStocksTab
+        earnings_tab = EarningsStocksTab(db_manager)
+        result = earnings_tab._get_earnings_stocks()
+        
+        logger.info(f"[CACHED CALL] Returning {len(result)} earnings stocks")
+        return result
+    except Exception as e:
+        logger.error(f"Error getting cached earnings stocks data: {e}")
+        return pd.DataFrame()
 
 def main():
     """Main function for the Earnings Calendar page"""
@@ -72,10 +85,10 @@ def main():
         st.sidebar.error("🔴 Connection Status Unknown")
     
     # Add some earnings-specific controls
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        if st.button("🔄 Refresh Earnings Data", help="Reload earnings data from database"):
+        if st.button("🔄 Clear Cache", help="Refresh data from database", key="earnings_clear_cache"):
             st.cache_data.clear()
             st.rerun()
     
@@ -85,15 +98,55 @@ def main():
     with col3:
         show_calendar_view = st.checkbox("📅 Calendar View", value=True, help="Show calendar layout")
     
+    with col4:
+        st.info("💡 **Cache Status**\nData cached for 1 hour")
+    
     st.markdown("---")
+    
+    # First, get the actual analysis data - this contains all we need (cached)
+    with st.spinner("Loading earnings stocks data..."):
+        earnings_tab = EarningsStocksTab(db_manager)
+        earnings_stocks_data = get_cached_earnings_stocks_data()
+    
+    # Extract symbols directly from the analysis results - no additional DB queries needed
+    if not earnings_stocks_data.empty:
+        # Use all symbols from analysis as available options (sorted)
+        symbol_list = sorted(earnings_stocks_data['symbol'].tolist())
+        # All earnings stocks as defaults
+        default_symbols = earnings_stocks_data['symbol'].tolist()
+        
+        st.sidebar.success(f"✅ Found {len(earnings_stocks_data)} earnings stocks")
+    else:
+        symbol_list = []
+        default_symbols = []
+        st.sidebar.warning("⚠️ No earnings data available")
+    
+    # Add symbol filter and chart options
+    with st.sidebar:
+        st.markdown("### 🎯 Symbol Filter")
+        
+        # Symbol multi-select
+        selected_symbols = st.multiselect(
+            "Select symbols to analyze:",
+            options=symbol_list,
+            default=default_symbols,
+            help="Earnings stocks pre-selected. Modify selection to focus on specific stocks."
+        )
+        
+        # Chart columns option
+        st.markdown("### 📊 Chart Layout")
+        chart_columns = st.selectbox(
+            "Chart columns:",
+            options=[1, 2, 3, 4],
+            index=0,  # Default to 1 column
+            help="Choose number of columns for individual stock charts"
+        )
     
     # Render the earnings analysis
     try:
-        earnings_tab = EarningsStocksTab(db_manager)
-        # We'll pass empty stock data since this is a standalone page
+        # Pass the already calculated data to avoid re-querying
         empty_stock_data = pd.DataFrame()
-        # Use the earnings tab but with page-specific context
-        earnings_tab.render("", empty_stock_data)
+        earnings_tab.render("", empty_stock_data, selected_symbols, chart_columns, earnings_stocks_data)
     except Exception as e:
         logger.error(f"Error rendering earnings analysis: {e}")
         st.error(f"Error loading earnings analysis: {e}")
