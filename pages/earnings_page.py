@@ -41,9 +41,12 @@ def get_cached_earnings_stocks_data():
         db_manager = DatabaseManager()
         logger.info("[CACHED CALL] Fetching earnings stocks data")
         
-        from pages.tabs import EarningsStocksTab
+        from pages.tabs.earnings_stocks_tab import EarningsStocksTab
+        from utils.earnings import EarningsDataFetcher
+        
         earnings_tab = EarningsStocksTab(db_manager)
-        result = earnings_tab._get_earnings_stocks()
+        data_fetcher = EarningsDataFetcher(db_manager)
+        result = data_fetcher.fetch_earnings_data()
         
         logger.info(f"[CACHED CALL] Returning {len(result)} earnings stocks")
         return result

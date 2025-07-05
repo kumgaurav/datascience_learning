@@ -170,21 +170,11 @@ class ConsistentPerformersTab:
             if debug_mode:
                 self.ui_renderer.display_period_debug_info(consistent_performers, months, raw_data)
             
-            # Filter by selected symbols if provided
-            if selected_symbols:
-                consistent_performers = self._filter_by_selected_symbols(consistent_performers, selected_symbols)
-                if consistent_performers.empty:
-                    return
-            
             # Display visualizations using visualizer utility
             self.visualizer.display_consistency_chart(consistent_performers, months)
             
-            # Display individual stock charts if symbols are selected
-            if selected_symbols:
-                st.markdown("---")
-                self._display_individual_charts_with_utilities(
-                    selected_symbols, chart_columns, raw_data, consistent_performers, months
-                )
+            # Display symbol selection interface and individual charts
+            self._display_symbol_selection_and_charts(consistent_performers, raw_data, months, selected_symbols, chart_columns, "period")
             
             # Display analysis components using UI renderer utility
             self.ui_renderer.display_consistency_table(consistent_performers, months)
@@ -240,27 +230,17 @@ class ConsistentPerformersTab:
             if debug_mode:
                 self.ui_renderer.display_all_time_debug_info(all_time_performers, consistent_1m, consistent_2m, consistent_3m)
             
-            # === STEP 4: FILTER BY SELECTED SYMBOLS ===
-            if selected_symbols:
-                all_time_performers = self._filter_all_time_by_selected_symbols(all_time_performers, selected_symbols)
-                if all_time_performers.empty:
-                    return
-            
-            # === STEP 5: VISUALIZATIONS ===
+            # === STEP 4: VISUALIZATIONS ===
             self.visualizer.display_consistency_chart(all_time_performers, months=0)  # 0 indicates all-time
             
-            # Display individual stock charts if symbols are selected
-            if selected_symbols:
-                st.markdown("---")
-                self._display_individual_charts_with_utilities(
-                    selected_symbols, chart_columns, raw_data, all_time_performers, months=3
-                )
+            # Display symbol selection interface and individual charts
+            self._display_symbol_selection_and_charts(all_time_performers, raw_data, 3, selected_symbols, chart_columns, "alltime")
             
-            # === STEP 6: UI COMPONENTS ===
+            # === STEP 5: UI COMPONENTS ===
             self.ui_renderer.display_all_time_performers_table(all_time_performers)
             self.ui_renderer.display_all_time_insights(all_time_performers, symbol)
             
-            # === STEP 7: CROSS-PERIOD COMPARISON ===
+            # === STEP 6: CROSS-PERIOD COMPARISON ===
             self._display_cross_period_comparison(all_time_performers, consistent_1m, consistent_2m, consistent_3m)
             
             logger.info(f"[_render_all_time_performers_analysis] Successfully completed for {len(all_time_performers)} stocks")
@@ -307,27 +287,7 @@ class ConsistentPerformersTab:
             logger.error(f"Error getting consistency data with utilities: {e}")
             raise DataFetchError(f"Failed to get consistency data for {months} months: {e}") from e
     
-    def _filter_by_selected_symbols(self, data: pd.DataFrame, selected_symbols: List[str]) -> pd.DataFrame:
-        """Filter consistency data by selected symbols."""
-        filtered_data = data[data['symbol'].isin(selected_symbols)]
-        if filtered_data.empty:
-            st.warning(f"No consistency data available for selected symbols: {', '.join(selected_symbols)}")
-            return pd.DataFrame()
-        
-        st.info(f"📊 Showing analysis for {len(selected_symbols)} selected symbols")
-        return filtered_data
-    
-    def _filter_all_time_by_selected_symbols(self, data: pd.DataFrame, selected_symbols: List[str]) -> pd.DataFrame:
-        """Filter all-time performers by selected symbols."""
-        filtered_data = data[data['symbol'].isin(selected_symbols)]
-        if filtered_data.empty:
-            st.warning(f"⚠️ None of the selected symbols appear in all 3 time periods.")
-            st.write(f"**Selected symbols:** {', '.join(selected_symbols)}")
-            st.write(f"**All-time champions:** {', '.join(data['symbol'].tolist())}")
-            return pd.DataFrame()
-        
-        st.info(f"📊 Showing {len(selected_symbols)} selected symbols from all-time performers")
-        return filtered_data
+
     
     def _display_individual_charts_with_utilities(self, selected_symbols: List[str], chart_columns: int, 
                                                  raw_data: Optional[pd.DataFrame], consistency_data: pd.DataFrame, 
@@ -368,6 +328,83 @@ class ConsistentPerformersTab:
         
         # Display using UI renderer utility
         self.ui_renderer.display_cross_period_comparison_table(comparison_data)
+    
+    def _display_symbol_selection_and_charts(self, consistency_data: pd.DataFrame, raw_data: Optional[pd.DataFrame], 
+                                           months: int, external_selected_symbols: Optional[List[str]] = None, 
+                                           chart_columns: int = 1, analysis_type: str = "period") -> None:
+        """
+        Display symbol selection interface and individual charts.
+        
+        Args:
+            consistency_data: Consistency data for symbol selection
+            raw_data: Raw stock data for charts
+            months: Number of months analyzed
+            external_selected_symbols: Externally provided selected symbols (may not match available data)
+            chart_columns: Number of chart columns
+            analysis_type: Type of analysis ("period" or "alltime") to make keys unique
+        """
+        if consistency_data.empty:
+            return
+        
+        st.markdown("---")
+        st.subheader("📈 Individual Stock Analysis")
+        
+        # Get available symbols from consistency data
+        available_symbols = consistency_data.nlargest(25, 'consistency_index')['symbol'].tolist()
+        
+        # Create symbol selection interface
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            # Check if external symbols are available in our data
+            default_symbols = []
+            if external_selected_symbols:
+                # Use external symbols if they exist in our data
+                matching_symbols = [sym for sym in external_selected_symbols if sym in available_symbols]
+                if matching_symbols:
+                    default_symbols = matching_symbols
+                    st.info(f"📊 Using {len(matching_symbols)} symbols from your selection that appear in consistency data")
+                else:
+                    st.info("📊 Your selected symbols don't appear in consistency data. Choose from top performers below.")
+            
+            # If no valid external symbols, use top performers as default
+            if not default_symbols:
+                default_symbols = available_symbols[:25]  # Top 25 by consistency index
+            
+            # Multi-select for symbols
+            selected_symbols = st.multiselect(
+                "🎯 Select Consistent Performers to Analyze:",
+                options=available_symbols,
+                default=default_symbols,
+                help="Select up to 25 stocks to display detailed price charts. Stocks are ordered by Consistency Index.",
+                key=f"consistent_performers_symbols_{analysis_type}_{months}_{len(available_symbols)}"
+            )
+        
+        with col2:
+            # Chart configuration
+            chart_columns = st.selectbox(
+                "Chart Columns:",
+                options=[1, 2, 3, 4],
+                index=0,  # Default to 1 column
+                help="Number of columns in the chart grid",
+                key=f"consistent_performers_chart_columns_{analysis_type}_{months}_{len(available_symbols)}"
+            )
+        
+        # Display charts if symbols are selected
+        if selected_symbols:
+            # Limit to 25 symbols for performance (consistent with top performers count)
+            if len(selected_symbols) > 25:
+                st.warning("⚠️ Please select maximum 25 symbols for better performance")
+                selected_symbols = selected_symbols[:25]
+            
+            # st.info(f"📊 Showing analysis for {len(selected_symbols)} selected symbols")
+            
+            # Display individual charts
+            self._display_individual_charts_with_utilities(
+                selected_symbols, chart_columns, raw_data, consistency_data, months
+            )
+        else:
+            st.info("👆 Select one or more symbols above to view detailed price charts")
 
 
 # Backward compatibility wrapper

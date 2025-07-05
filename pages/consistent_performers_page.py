@@ -73,8 +73,10 @@ def get_cached_consistent_performers_data():
         
         logger.info(f"[CACHED CALL] Loaded {len(all_data)} rows for consistency analysis")
         
-        # Process the data using the tab's logic
-        from pages.tabs import ConsistentPerformersTab
+        # Process the data using the new utility-based approach
+        from pages.tabs.consistent_performers_tab import ConsistentPerformersTab
+        from utils.consistency import ConsistencyCalculator
+        
         temp_tab = ConsistentPerformersTab(db_manager)
         
         # Convert data types
@@ -86,8 +88,9 @@ def get_cached_consistent_performers_data():
         all_data = all_data.dropna(subset=['close'])
         all_data = all_data[all_data['close'] > 0]
         
-        # Calculate consistency statistics
-        consistency_results = temp_tab._calculate_consistency_statistics(all_data, start_date, end_date)
+        # Calculate consistency statistics using the new utility approach
+        calculator = ConsistencyCalculator()
+        consistency_results = calculator.calculate_consistency_statistics(all_data, months=3)
         
         if consistency_results.empty:
             logger.warning("[CACHED CALL] No consistency results calculated")

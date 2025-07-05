@@ -18,8 +18,6 @@ import seaborn as sns
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 
-from utils.chart_utils import ChartUtils
-
 # Configuration constants
 TOP_PERFORMERS_COUNT = 25
 MAX_CHART_SYMBOLS = 15
@@ -183,8 +181,6 @@ class ConsistencyVisualizer:
             consistency_data: Optional consistency data for sorting by return
         """
         try:
-            from utils.chart_utils import ChartUtils
-            
             # Sort symbols by total return if consistency data is available
             if consistency_data is not None and not consistency_data.empty:
                 # Filter consistency data for the selected symbols
@@ -232,36 +228,46 @@ class ConsistencyVisualizer:
                 if heavily_reduced_stocks and strict_filtering_applied:
                     info_msg += f"\n\n⚡ **Volatile Stock Filtering Applied**: Extra filtering applied to {len(heavily_reduced_stocks)} volatile stocks ({', '.join(heavily_reduced_stocks[:3])}{', ...' if len(heavily_reduced_stocks) > 3 else ''}) to maintain chart readability."
                 
-                st.info(info_msg)
+                # st.info(info_msg)
             
             # Convert DataFrame to dict for caching (Streamlit can't cache DataFrames with complex objects)
             price_data_dict = reduced_price_data.to_dict('records') if not reduced_price_data.empty else {}
+            logger.info(f"[create_individual_price_charts] Converted DataFrame to dict: {len(price_data_dict)} records")
             
-            # Use centralized chart utils for figure generation
+            # Use independent chart creation for consistency analysis
             try:
-                fig = ChartUtils.create_cached_matplotlib_figure(
-                    'individual', price_data_dict, symbols, chart_columns
+                logger.info(f"[create_individual_price_charts] Creating charts for {len(symbols)} symbols: {symbols}")
+                fig = self._create_consistency_matplotlib_figure(
+                    price_data_dict, symbols, chart_columns, consistency_data
                 )
+                logger.info(f"[create_individual_price_charts] Figure creation result: {fig is not None}")
             except Exception as chart_error:
-                logger.error(f"Chart creation failed: {chart_error}")
+                logger.error(f"Chart creation failed with exception: {chart_error}")
                 st.error(f"Failed to create matplotlib figure: {chart_error}")
                 return
             
             if fig is not None:
-                # Display the cached figure
-                st.pyplot(fig, clear_figure=True)
-                
-                # Add explanatory note about the data reduction
-                st.markdown(f"""
-                **📈 Consistency Chart Information:**
-                - Charts show **key price movements only** for clearer consistency analysis over {months} {'month' if months == 1 else 'months'}
-                - Includes: Start/end points, significant changes (>{st.session_state.get('data_reduction_threshold', 3.0):.1f}%), peaks & valleys
-                - **Green annotations**: Price increases | **Red annotations**: Price decreases
-                - Focus on trend stability and consistent growth patterns for investment decisions
-                - **Tip**: Adjust "Chart detail level" in sidebar to show more/fewer data points
-                """)
+                try:
+                    # Display the cached figure
+                    logger.info("[create_individual_price_charts] Displaying matplotlib figure")
+                    st.pyplot(fig, clear_figure=True)
+                    logger.info("[create_individual_price_charts] Figure displayed successfully")
+                    
+                    # Add explanatory note about the data reduction
+                    st.markdown(f"""
+                    **📈 Consistency Chart Information:**
+                    - Charts show **key price movements only** for clearer consistency analysis over {months} {'month' if months == 1 else 'months'}
+                    - Includes: Start/end points, significant changes (>{st.session_state.get('data_reduction_threshold', 3.0):.1f}%), peaks & valleys
+                    - **Green annotations**: Price increases | **Red annotations**: Price decreases
+                    - Focus on trend stability and consistent growth patterns for investment decisions
+                    - **Tip**: Adjust "Chart detail level" in sidebar to show more/fewer data points
+                    """)
+                except Exception as display_error:
+                    logger.error(f"Failed to display matplotlib figure: {display_error}")
+                    st.error(f"Failed to display chart: {display_error}")
             else:
-                st.error("Failed to create individual stock charts")
+                logger.error("[create_individual_price_charts] Figure creation returned None")
+                st.error("Failed to create individual stock charts - figure creation returned None")
             
         except Exception as e:
             logger.error(f"Unexpected error creating individual charts: {e}")
@@ -528,7 +534,7 @@ class ConsistencyVisualizer:
             if heavily_reduced_stocks and strict_filtering_applied:
                 info_msg += f"\n\n⚡ **Volatile Stock Filtering Applied**: Extra filtering applied to {len(heavily_reduced_stocks)} volatile stocks ({', '.join(heavily_reduced_stocks[:3])}{', ...' if len(heavily_reduced_stocks) > 3 else ''}) to maintain chart readability."
             
-            st.info(info_msg)
+            # st.info(info_msg)
     
     def _display_chart_information(self, months: int) -> None:
         """Display information about the consistency charts."""
@@ -550,4 +556,258 @@ class ConsistencyVisualizer:
             - **Green annotations**: Price increases | **Red annotations**: Price decreases
             - Focus on trend stability and consistent growth patterns for investment decisions
             - **Tip**: Adjust "Chart detail level" in sidebar to show more/fewer data points
-            """) 
+            """)
+    
+    def _create_consistency_matplotlib_figure(self, price_data_dict: dict, symbols: list, chart_columns: int, consistency_data: Optional[pd.DataFrame] = None):
+        """
+        Create independent matplotlib figure for consistency analysis.
+        
+        Args:
+            price_data_dict: Dict of price data converted for caching
+            symbols: List of symbols to chart
+            chart_columns: Number of columns in grid
+            consistency_data: Optional consistency data for metrics
+            
+        Returns:
+            matplotlib Figure object
+        """
+        try:
+            # Convert dict back to DataFrame
+            price_data = pd.DataFrame(price_data_dict)
+            logger.info(f"[_create_consistency_matplotlib_figure] Converted dict back to DataFrame: {len(price_data)} rows, columns: {list(price_data.columns) if not price_data.empty else 'empty'}")
+            
+            if not price_data.empty:
+                if 'date' in price_data.columns:
+                    price_data['date'] = pd.to_datetime(price_data['date'])
+                if 'Date' in price_data.columns:
+                    price_data['Date'] = pd.to_datetime(price_data['Date'])
+            
+            logger.info(f"[CONSISTENCY CHART] Creating matplotlib figure for {len(symbols)} symbols")
+            
+            # Calculate number of rows needed
+            nrows = (len(symbols) + chart_columns - 1) // chart_columns
+            
+            # Create figure with proper sizing - limit to prevent memory issues
+            max_height = 100  # Maximum height limit
+            calculated_height = 5 * nrows
+            fig_height = min(calculated_height, max_height)
+            
+            # Ensure matplotlib is using the right backend for Streamlit
+            import matplotlib
+            matplotlib.use('Agg')  # Use non-interactive backend
+            
+            fig, axes = plt.subplots(
+                nrows=nrows,
+                ncols=chart_columns,
+                figsize=(18, fig_height),
+                sharex=False,
+                sharey=False
+            )
+            
+            logger.info(f"[_create_consistency_matplotlib_figure] Created figure with {nrows} rows, {chart_columns} columns, size: {fig.get_size_inches()}")
+            
+            # Set style - use a more reliable approach
+            try:
+                plt.style.use('seaborn-v0_8')
+            except:
+                try:
+                    plt.style.use('seaborn')
+                except:
+                    # Use default style and set parameters manually
+                    plt.style.use('default')
+                    plt.rcParams['axes.grid'] = True
+                    plt.rcParams['grid.alpha'] = 0.3
+            
+            # Handle single subplot case
+            if nrows == 1 and chart_columns == 1:
+                axes = [axes]
+            elif nrows == 1 or chart_columns == 1:
+                axes = axes.flatten()
+            else:
+                axes = axes.flatten()
+            
+            # Create chart for each symbol
+            for idx, symbol in enumerate(symbols):
+                if idx < len(axes):
+                    ax = axes[idx]
+                    
+                    symbol_data = price_data[price_data['symbol'] == symbol].copy()
+                    logger.info(f"[_create_consistency_matplotlib_figure] Symbol {symbol}: {len(symbol_data)} data points")
+                    
+                    if not symbol_data.empty:
+                        # Get consistency metrics if available
+                        consistency_metrics = {}
+                        if consistency_data is not None and not consistency_data.empty:
+                            symbol_consistency = consistency_data[consistency_data['symbol'] == symbol]
+                            if not symbol_consistency.empty:
+                                row = symbol_consistency.iloc[0]
+                                consistency_metrics = {
+                                    'consistency_index': row.get('consistency_index', 0),
+                                    'positive_months_ratio': row.get('positive_months_ratio', 0),
+                                    'total_return': row.get('total_return', 0)
+                                }
+                        
+                        logger.info(f"[_create_consistency_matplotlib_figure] Creating chart for {symbol} with metrics: {consistency_metrics}")
+                        self._create_consistency_stock_chart(ax, symbol_data, symbol, consistency_metrics)
+                    else:
+                        logger.warning(f"[_create_consistency_matplotlib_figure] No data for symbol {symbol}")
+                        self._handle_empty_consistency_chart(ax, symbol)
+            
+            # Hide unused subplots
+            for idx in range(len(symbols), len(axes)):
+                axes[idx].axis('off')
+            
+            # Apply tight layout with padding
+            try:
+                plt.tight_layout(pad=2.0)
+            except Exception as layout_error:
+                logger.warning(f"Layout adjustment failed: {layout_error}")
+                # Continue anyway - the chart may still be displayable
+            
+            logger.info(f"[CONSISTENCY CHART] Matplotlib figure created successfully")
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Error creating consistency matplotlib figure: {e}")
+            # Try to create a simple fallback figure
+            try:
+                fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+                ax.text(0.5, 0.5, f'Chart creation failed\nError: {str(e)[:100]}...', 
+                        ha='center', va='center', transform=ax.transAxes,
+                        fontsize=12, color='red')
+                ax.set_title('Chart Creation Error', fontsize=14, fontweight='bold')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                logger.info("Created fallback error chart")
+                return fig
+            except Exception as fallback_error:
+                logger.error(f"Even fallback chart creation failed: {fallback_error}")
+                return None
+    
+    def _create_consistency_stock_chart(self, ax, symbol_data, symbol, consistency_metrics):
+        """
+        Create individual stock chart for consistency analysis.
+        
+        Args:
+            ax: matplotlib axis object
+            symbol_data: DataFrame with stock data
+            symbol: Stock symbol
+            consistency_metrics: Dict with consistency metrics
+        """
+        try:
+            symbol_data = symbol_data.sort_values('date')
+            
+            # Ensure numeric conversion
+            symbol_data['close'] = pd.to_numeric(symbol_data['close'], errors='coerce')
+            
+            # Get values for the title
+            max_close = symbol_data['close'].max()
+            min_close = symbol_data['close'].min()
+            first_price = symbol_data.iloc[0]['close']
+            last_price = symbol_data.iloc[-1]['close']
+            total_return = ((last_price - first_price) / first_price) * 100
+            
+            # Determine color for overall return
+            return_color = 'green' if total_return >= 0 else 'red'
+            
+            # Plot Close as a line graph with markers
+            ax.plot(
+                symbol_data['date'],
+                symbol_data['close'],
+                marker='o',
+                linestyle='-',
+                label="Close Price",
+                linewidth=2,
+                color="blue"
+            )
+            
+            # Annotate price values with color based on price change
+            self._add_consistency_price_annotations(ax, symbol_data)
+            
+            # Build title with consistency metrics
+            title_parts = [f"**{symbol}**"]
+            
+            # Add consistency-specific metrics
+            if consistency_metrics:
+                if 'consistency_index' in consistency_metrics:
+                    title_parts.append(f"CI: {consistency_metrics['consistency_index']:.3f}")
+                if 'positive_months_ratio' in consistency_metrics:
+                    title_parts.append(f"+{consistency_metrics['positive_months_ratio']:.0%} pos")
+            
+            # Add standard metrics
+            title_parts.extend([
+                f"Max: ${max_close:.2f}",
+                f"Min: ${min_close:.2f}",
+                "Return: "
+            ])
+            
+            # Set title
+            title_text = " | ".join(title_parts)
+            ax.set_title(
+                title_text,
+                fontsize=18,
+                fontweight='bold',
+                pad=10
+            )
+            
+            # Add colored return percentage (using volatile stocks approach with extra spacing)
+            return_color = 'green' if total_return >= 0 else 'red'
+            ax.text(0.75, 1.02, f"{total_return:+.1f}%", 
+                    transform=ax.transAxes, fontsize=16, fontweight='bold',
+                    color=return_color, ha='left', va='bottom')
+            
+            # Set labels and formatting
+            self._format_consistency_chart_axes(ax)
+            
+        except Exception as e:
+            logger.error(f"Error creating consistency chart for {symbol}: {e}")
+            self._handle_empty_consistency_chart(ax, symbol)
+    
+    def _add_consistency_price_annotations(self, ax, symbol_data):
+        """Add price annotations with color coding for consistency charts."""
+        prices = symbol_data['close'].tolist()
+        dates = symbol_data['date'].tolist()
+        
+        for i, (date, close) in enumerate(zip(dates, prices)):
+            # Determine color based on price change from previous point
+            if i == 0:
+                text_color = "black"  # First point
+            else:
+                prev_price = prices[i-1]
+                if close > prev_price:
+                    text_color = "green"  # Price increased
+                elif close < prev_price:
+                    text_color = "red"    # Price decreased
+                else:
+                    text_color = "black"  # Price unchanged
+            
+            ax.text(
+                date, close, f"${close:.2f}",
+                fontsize=10,
+                fontweight='bold',
+                ha="right",
+                va="bottom",
+                color=text_color,
+                bbox=dict(facecolor='white', edgecolor='black', boxstyle='round,pad=0.3')
+            )
+    
+    def _format_consistency_chart_axes(self, ax):
+        """Format axes for consistency charts."""
+        ax.set_xlabel("Date", fontsize=10, fontweight='bold')
+        ax.set_ylabel("Close Price ($)", fontsize=10, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper left')
+        
+        # Configure x-axis for proper date formatting
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+        ax.tick_params(axis='x', rotation=45)
+    
+    def _handle_empty_consistency_chart(self, ax, symbol):
+        """Handle case where no data is available for a consistency symbol."""
+        ax.text(0.5, 0.5, f'No data available\nfor {symbol}', 
+                ha='center', va='center', transform=ax.transAxes,
+                fontsize=12, color='gray')
+        ax.set_title(f'{symbol} - No Data (Consistency)', fontsize=18, fontweight='bold')
+        ax.set_xticks([])
+        ax.set_yticks([]) 
