@@ -64,7 +64,7 @@ def main():
     st.markdown("""
     **Comprehensive earnings analysis for stocks with upcoming earnings announcements**
     
-    This page shows stocks with earnings in the next 4 weeks, along with:
+    This page shows stocks with earnings in the next 3 weeks, along with:
     - 📅 Weekly earnings calendar
     - ⚡ Volatility analysis and scoring
     - 📈 Pre-earnings price charts

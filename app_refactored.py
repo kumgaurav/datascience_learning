@@ -125,8 +125,8 @@ def main():
             - **🏠 Home**: Stock change tracker and main dashboard (this page)
             - **🏆 Top Performers**: Analysis of best performing stocks over 3 months
             - **🎯 Consistent Performers**: Statistical analysis of stocks with consistent performance across ALL 3 months
-            - **⚡ Volatile Stocks**: Most volatile stocks with positive returns (4 weeks)  
-            - **📅 Earnings Calendar**: Stocks with upcoming earnings (next 4 weeks)
+            - **⚡ Volatile Stocks**: Most volatile stocks with positive returns (4 weeks)
+            - **📅 Earnings Calendar**: Stocks with upcoming earnings (next 3 weeks)
             
             **Navigation**: Use the page selector in the sidebar to switch between analyses.
             Each page has its own URL and runs independently!
