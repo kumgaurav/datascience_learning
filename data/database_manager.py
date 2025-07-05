@@ -112,7 +112,7 @@ class DatabaseManager:
     def get_stock_change_tracker(self, page: int = 1, page_size: int = 50, 
                                 search: str = '') -> pd.DataFrame:
         """
-        Get stock change tracker data with pagination
+        Get stock change tracker data with pagination including company details
         
         Args:
             page: Page number (1-based)
@@ -120,7 +120,7 @@ class DatabaseManager:
             search: Search term for symbol filtering
         
         Returns:
-            DataFrame with stock change tracker data
+            DataFrame with stock change tracker data including company details
         """
         try:
             offset = (page - 1) * page_size
@@ -131,13 +131,18 @@ class DatabaseManager:
                     sct.change_in_percent,
                     sct.current_price,
                     sct.price_when_added,
-                    se.earnings_date
+                    se.earnings_date,
+                    sd.company_name,
+                    sd.sector,
+                    sd.industry,
+                    sd.market_cap
                 FROM stocksdb.stock_change_tracker sct
                 LEFT JOIN stocksdb.stocks_earnings se ON sct.symbol = se.symbol
+                LEFT JOIN stocksdb.stock_details sd ON sct.symbol = sd.symbol
             """
             
             if search:
-                base_query += " WHERE sct.symbol LIKE %(search)s"
+                base_query += " WHERE (sct.symbol LIKE %(search)s OR sd.company_name LIKE %(search)s)"
                 params = {'search': f'%{search}%'}
             else:
                 params = None
@@ -146,7 +151,7 @@ class DatabaseManager:
             base_query += f" LIMIT {page_size} OFFSET {offset}"
             
             df = self.execute_query(base_query, params)
-            logger.info(f"Loaded {len(df)} rows from stock_change_tracker")
+            logger.info(f"Loaded {len(df)} rows from stock_change_tracker with company details")
             
             return df
             
@@ -154,7 +159,8 @@ class DatabaseManager:
             logger.error(f"Error fetching stock change tracker data: {e}")
             # Return empty DataFrame with expected columns
             return pd.DataFrame(columns=['symbol', 'change_in_percent', 'current_price', 
-                                       'price_when_added', 'earnings_date'])
+                                       'price_when_added', 'market_cap', 'earnings_date',
+                                       'company_name', 'sector', 'industry'])
     
     def get_stock_data(self, symbol: str, limit: int = 1000) -> pd.DataFrame:
         """
@@ -193,25 +199,30 @@ class DatabaseManager:
     
     def get_stock_info(self, symbol: str) -> Dict[str, Any]:
         """
-        Get basic stock information
+        Get basic stock information including company details
         
         Args:
             symbol: Stock symbol
         
         Returns:
-            Dictionary with stock information
+            Dictionary with stock information including company details
         """
         try:
-            # Get basic info from stock_change_tracker
+            # Get basic info from stock_change_tracker with company details
             query = """
                 SELECT 
                     sct.symbol,
                     sct.change_in_percent,
                     sct.current_price,
                     sct.price_when_added,
-                    se.earnings_date
+                    se.earnings_date,
+                    sd.company_name,
+                    sd.sector,
+                    sd.industry,
+                    sd.market_cap
                 FROM stocksdb.stock_change_tracker sct
                 LEFT JOIN stocksdb.stocks_earnings se ON sct.symbol = se.symbol
+                LEFT JOIN stocksdb.stock_details sd ON sct.symbol = sd.symbol
                 WHERE sct.symbol = %(symbol)s
             """
             
@@ -224,7 +235,11 @@ class DatabaseManager:
                     'change_in_percent': row['change_in_percent'],
                     'current_price': row['current_price'],
                     'price_when_added': row['price_when_added'],
-                    'earnings_date': row['earnings_date']
+                    'market_cap': row['market_cap'],
+                    'earnings_date': row['earnings_date'],
+                    'company_name': row['company_name'],
+                    'sector': row['sector'],
+                    'industry': row['industry']
                 }
             else:
                 return {'symbol': symbol, 'error': 'Stock not found'}

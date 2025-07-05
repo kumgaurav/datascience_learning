@@ -132,6 +132,14 @@ class HomePage:
         display_df['Current Price'] = display_df['current_price'].apply(format_currency)
         display_df['Initial Price'] = display_df['price_when_added'].apply(format_currency)
         
+        # Format market cap
+        display_df['Market Cap'] = display_df['market_cap'].apply(
+            lambda x: f"${x/1e9:.1f}B" if pd.notnull(x) and x >= 1e9 
+            else f"${x/1e6:.1f}M" if pd.notnull(x) and x >= 1e6
+            else f"${x:,.0f}" if pd.notnull(x) and x > 0
+            else "N/A"
+        )
+        
         # Format earnings date
         display_df['Earnings Date'] = pd.to_datetime(display_df['earnings_date'], errors='coerce').dt.strftime('%Y-%m-%d')
         display_df['Earnings Date'] = display_df['Earnings Date'].fillna('N/A')
@@ -141,8 +149,14 @@ class HomePage:
             lambda x: self.db_manager.is_earnings_within_weeks(x, 3)
         )
         
+        # Clean up company details columns
+        display_df['Company Name'] = display_df['company_name'].fillna('N/A')
+        display_df['Sector'] = display_df['sector'].fillna('N/A')
+        display_df['Industry'] = display_df['industry'].fillna('N/A')
+        
         # Select and reorder columns for display
-        display_columns = ['symbol', 'Change %', 'Current Price', 'Initial Price', 
+        display_columns = ['symbol', 'Company Name', 'Sector', 'Industry', 'Market Cap',
+                          'Change %', 'Current Price', 'Initial Price', 
                           'Earnings Date', 'Earnings Soon']
         
         return display_df[display_columns]
@@ -160,17 +174,21 @@ class HomePage:
         # Remove the 'Earnings Soon' column for display
         display_df = display_df.drop('Earnings Soon', axis=1)
         
-        # Display the dataframe without complex styling to avoid issues
+        # Display the dataframe with updated column configuration
         st.dataframe(
             display_df,
             use_container_width=True,
             hide_index=True,
             column_config={
                 "symbol": st.column_config.TextColumn("Symbol", width="small"),
+                "Company Name": st.column_config.TextColumn("Company Name", width="medium"),
+                "Sector": st.column_config.TextColumn("Sector", width="medium"),
+                "Industry": st.column_config.TextColumn("Industry", width="medium"),
+                "Market Cap": st.column_config.TextColumn("Market Cap", width="small"),
                 "Change %": st.column_config.TextColumn("Change %", width="small"),
-                "Current Price": st.column_config.TextColumn("Current Price", width="medium"),
-                "Initial Price": st.column_config.TextColumn("Initial Price", width="medium"),
-                "Earnings Date": st.column_config.TextColumn("Earnings Date", width="medium")
+                "Current Price": st.column_config.TextColumn("Current Price", width="small"),
+                "Initial Price": st.column_config.TextColumn("Initial Price", width="small"),
+                "Earnings Date": st.column_config.TextColumn("Earnings Date", width="small")
             }
         )
         
@@ -181,8 +199,6 @@ class HomePage:
         
         # Handle symbol clicks
         self._handle_symbol_selection(df)
-    
-
     
     def _handle_symbol_selection(self, df: pd.DataFrame):
         """

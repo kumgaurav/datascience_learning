@@ -45,17 +45,17 @@ class BestPerformersTab:
             
             query = f"""
             SELECT p.symbol, date, close, high, low, volume
-            FROM stocksinfp as p
-            LEFT JOIN stock_change_tracker as s ON s.symbol = p.symbol
+            FROM stocksinfp p
+            INNER JOIN stock_change_tracker s ON s.symbol = p.symbol 
+                AND s.is_active = 1 
+                AND s.current_price > 5
             WHERE p.symbol IN ('{symbols_str}')
             AND date >= %s AND date <= %s
             AND close IS NOT NULL AND close != '' AND close != '0'
-            AND CAST(close AS DECIMAL(10,2)) >= %s
-            AND s.is_active = 1
             ORDER BY symbol, date
             """
             
-            data = db_manager.execute_query(query, (start_date, end_date, min_price))
+            data = db_manager.execute_query(query, (start_date, end_date))
             
             if data.empty:
                 logger.info("[CACHED CALL] No price data found")
@@ -136,25 +136,23 @@ class BestPerformersTab:
             logger.info(f"Fetching all stock data from {start_date.date()} to {end_date.date()}")
             
             # Get ALL stock data for the last 3 months in one query
-            # Include minimum price filter from config
-            min_price = self.db_manager.get_minimum_price_filter()
+            # Use stock_change_tracker for consistent symbol filtering
             
             query = """
             SELECT p.symbol, date, close, volume
-            FROM stocksinfp as p
-            LEFT JOIN stock_change_tracker as s ON s.symbol = p.symbol
+            FROM stocksinfp p
+            INNER JOIN stock_change_tracker s ON s.symbol = p.symbol 
+                AND s.is_active = 1 
+                AND s.current_price > 5
             WHERE date >= %(start_date)s AND date <= %(end_date)s
             AND close IS NOT NULL AND close != '' AND close != '0'
-            AND CAST(close AS DECIMAL(10,2)) >= %(min_price)s
-            AND s.is_active = 1
             ORDER BY symbol, date
             """
             
             # Single database call to get all data
             all_data = self.db_manager.execute_query(query, {
                 'start_date': start_date,
-                'end_date': end_date,
-                'min_price': min_price
+                'end_date': end_date
             })
             
             if all_data.empty:

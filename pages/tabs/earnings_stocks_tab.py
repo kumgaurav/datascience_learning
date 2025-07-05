@@ -106,6 +106,7 @@ class EarningsStocksTab:
             min_price = self.db_manager.get_minimum_price_filter()
             
             # Query to get stocks with earnings in next 4 weeks and their price data
+            # Use stock_change_tracker for consistent symbol filtering
             query = """
             SELECT DISTINCT
                 p.symbol, 
@@ -115,16 +116,16 @@ class EarningsStocksTab:
                 p.low, 
                 p.volume,
                 se.earnings_date
-            FROM stocksdb.stocksinfp as p
-            LEFT JOIN stocksdb.stock_change_tracker as s ON s.symbol = p.symbol
-            INNER JOIN stocksdb.stocks_earnings as se ON p.symbol = se.symbol
+            FROM stocksdb.stocksinfp p
+            INNER JOIN stocksdb.stock_change_tracker s ON s.symbol = p.symbol 
+                AND s.is_active = 1 
+                AND s.current_price > 5
+            INNER JOIN stocksdb.stocks_earnings se ON p.symbol = se.symbol
             WHERE p.date >= %(start_date)s AND p.date <= %(end_date)s
             AND se.earnings_date >= %(earnings_start)s AND se.earnings_date <= %(earnings_end)s
             AND p.close IS NOT NULL AND p.close != '' AND p.close != '0'
             AND p.high IS NOT NULL AND p.high != '' AND p.high != '0'
             AND p.low IS NOT NULL AND p.low != '' AND p.low != '0'
-            AND CAST(p.close AS DECIMAL(10,2)) >= %(min_price)s
-            AND (s.is_active = 1 OR s.is_active IS NULL)
             ORDER BY p.symbol, p.date
             """
             
@@ -132,8 +133,7 @@ class EarningsStocksTab:
                 'start_date': start_date,
                 'end_date': end_date,
                 'earnings_start': end_date,
-                'earnings_end': earnings_end_date,
-                'min_price': min_price
+                'earnings_end': earnings_end_date
             })
             
             if all_data.empty:
@@ -747,7 +747,7 @@ class EarningsStocksTab:
         ax.text(0.5, 0.5, f'No data\nfor {symbol}', 
                 horizontalalignment='center', verticalalignment='center',
                 transform=ax.transAxes, fontsize=12)
-        ax.set_title(f'{symbol} - No Data Available')
+        ax.set_title(f'{symbol} - No Data Available', fontsize=16, fontweight='bold')
         ax.set_xticks([])
         ax.set_yticks([])
     
@@ -814,15 +814,15 @@ class EarningsStocksTab:
             ax.set_title(f'**{symbol}** | ERD: {earnings_str}, Days: {days_to_earnings}\n'
                         f'VS: {volatility_score:.2f}, Max: ${max_price:.2f}, Min: ${min_price:.2f}\n'
                         f'Return: ',
-                        fontsize=9, fontweight='bold', pad=10)
+                        fontsize=16, fontweight='bold', pad=10)
             
             # Add colored return and momentum values closer to the text
             ax.text(0.12, 0.92, f"{total_return:+.1f}%", 
-                    transform=ax.transAxes, fontsize=9, fontweight='bold',
+                    transform=ax.transAxes, fontsize=14, fontweight='bold',
                     color=return_color, ha='left', va='top')
             
             ax.text(0.20, 0.92, f", Momentum: {recent_momentum:+.1f}%", 
-                    transform=ax.transAxes, fontsize=9, fontweight='bold',
+                    transform=ax.transAxes, fontsize=14, fontweight='bold',
                     color=momentum_color, ha='left', va='top')
             
             # Set axis labels with bold text
@@ -998,22 +998,21 @@ class EarningsStocksTab:
             # Format symbols for SQL IN clause
             symbols_str = "', '".join(symbols)
             
-            # Include minimum price filter from config
-            min_price = self.db_manager.get_minimum_price_filter()
+            # Use stock_change_tracker for consistent symbol filtering
             
             query = f"""
             SELECT p.symbol, date, close, high, low, volume
-            FROM stocksinfp as p
-            LEFT JOIN stock_change_tracker as s ON s.symbol = p.symbol
+            FROM stocksinfp p
+            INNER JOIN stock_change_tracker s ON s.symbol = p.symbol 
+                AND s.is_active = 1 
+                AND s.current_price > 5
             WHERE p.symbol IN ('{symbols_str}')
             AND date >= %s AND date <= %s
             AND close IS NOT NULL AND close != '' AND close != '0'
-            AND CAST(close AS DECIMAL(10,2)) >= %s
-            AND s.is_active = 1
             ORDER BY symbol, date
             """
             
-            data = self.db_manager.execute_query(query, (start_date, end_date, min_price))
+            data = self.db_manager.execute_query(query, (start_date, end_date))
             
             if data.empty:
                 return pd.DataFrame()
@@ -1156,14 +1155,14 @@ class EarningsStocksTab:
             # Set title with bold symbol and earnings date (black text, no return)
             ax.set_title(
                 f"**{symbol}** | Max: ${max_close:.2f}, Min: ${min_close:.2f}, ERD: {earnings_date_str}, Return: ",
-                fontsize=12,
+                fontsize=18,
                 fontweight='bold',
                 pad=10
             )
             
             # Add colored return percentage right after "Return: "
             ax.text(0.78, 1.02, f"{total_return:+.1f}%", 
-                    transform=ax.transAxes, fontsize=12, fontweight='bold',
+                    transform=ax.transAxes, fontsize=16, fontweight='bold',
                     color=return_color, ha='left', va='bottom')
             
             # Set individual x-axis label for each chart
@@ -1219,6 +1218,6 @@ class EarningsStocksTab:
         ax.text(0.5, 0.5, f'No data available\nfor {symbol}', 
                 ha='center', va='center', transform=ax.transAxes,
                 fontsize=12, color='gray')
-        ax.set_title(f'{symbol} - No Data (Earnings)', fontsize=12, fontweight='bold')
+        ax.set_title(f'{symbol} - No Data (Earnings)', fontsize=18, fontweight='bold')
         ax.set_xticks([])
         ax.set_yticks([]) 
