@@ -324,7 +324,7 @@ class EarningsStocksTab:
             
             # Display symbol selection interface using UI renderer
             selected_symbols, chart_columns = self.ui_renderer.display_symbol_selection_interface(
-                available_symbols, default_count=min(10, len(available_symbols))
+                available_symbols, default_count=min(10, len(available_symbols)), unique_id=week_title.replace(' ', '_').lower()
             )
             
             # Display individual charts if symbols are selected

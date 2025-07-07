@@ -288,11 +288,29 @@ class DatabaseManager:
             connection = self._get_connection()
             if connection and connection.is_connected():
                 connection.close()
-                return {'status': 'Connected', 'timestamp': datetime.now()}
+                return {
+                    'status': 'Connected', 
+                    'timestamp': datetime.now(),
+                    'host': self.config['mysql']['url'],
+                    'port': self.config['mysql'].get('port', '3306'),
+                    'database': self.config['mysql']['database']
+                }
             else:
-                return {'status': 'Disconnected', 'error': 'Failed to establish connection'}
+                return {
+                    'status': 'Disconnected', 
+                    'error': 'Failed to establish connection',
+                    'host': self.config['mysql']['url'],
+                    'port': self.config['mysql'].get('port', '3306'),
+                    'database': self.config['mysql']['database']
+                }
         except Exception as e:
-            return {'status': 'Error', 'error': str(e)}
+            return {
+                'status': 'Error', 
+                'error': str(e),
+                'host': self.config['mysql'].get('url', 'unknown'),
+                'port': self.config['mysql'].get('port', '3306'),
+                'database': self.config['mysql'].get('database', 'unknown')
+            }
     
     def get_minimum_price_filter(self) -> float:
         """
