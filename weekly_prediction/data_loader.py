@@ -1,33 +1,46 @@
 import pandas as pd
 from datetime import date
+from typing import Optional
 
-def load_all_data(file_date=date(2024, 6, 1)):
+def load_all_data(file_date: Optional[date] = None):
     """
     Loads and merges all data files for a specific date.
 
     It intelligently merges the latest quarterly report for each stock.
 
     Args:
-        file_date (datetime.date): The date suffix of the files to load.
+        file_date (datetime.date | None): The date suffix of the files to load. If None, uses undated files.
 
     Returns:
         tuple(pd.DataFrame, pd.DataFrame): 
             - A master DataFrame with one row per ticker containing the latest data.
             - A timeseries DataFrame with all historical prices.
     """
-    suffix = file_date.strftime('%Y-%m-%d')
+    suffix = file_date.strftime('%Y-%m-%d') if file_date is not None else None
     correct_date_column = 'date' 
     try:
         # --- Load all data sources ---
-        prices = pd.read_csv(f'data/stock_prices_{suffix}.csv', parse_dates=[correct_date_column])
-        earnings = pd.read_csv(f'data/stock_earnings_{suffix}.csv', parse_dates=['earnings_date'])
-        earn_est = pd.read_csv(f'data/earnings_estimates_{suffix}.csv', parse_dates=['earnings_date'])
-        income = pd.read_csv(f'data/quarterly_income_{suffix}.csv', parse_dates=['report_date'])
-        revenue = pd.read_csv(f'data/quarterly_revenue_{suffix}.csv', parse_dates=['report_date'])
-        rev_est = pd.read_csv(f'data/revenue_estimates_{suffix}.csv', parse_dates=['next_earnings_date'])
-        growth_est = pd.read_csv(f'data/growth_estimates_{suffix}.csv')
+        if suffix:
+            prices = pd.read_csv(f'data/stock_prices_{suffix}.csv', parse_dates=[correct_date_column])
+            earnings = pd.read_csv(f'data/stock_earnings_{suffix}.csv', parse_dates=['earnings_date'])
+            earn_est = pd.read_csv(f'data/earnings_estimates_{suffix}.csv', parse_dates=['earnings_date'])
+            income = pd.read_csv(f'data/quarterly_income_{suffix}.csv', parse_dates=['report_date'])
+            revenue = pd.read_csv(f'data/quarterly_revenue_{suffix}.csv', parse_dates=['report_date'])
+            rev_est = pd.read_csv(f'data/revenue_estimates_{suffix}.csv', parse_dates=['next_earnings_date'])
+            growth_est = pd.read_csv(f'data/growth_estimates_{suffix}.csv')
+        else:
+            prices = pd.read_csv('data/stock_prices.csv', parse_dates=[correct_date_column])
+            earnings = pd.read_csv('data/stock_earnings.csv', parse_dates=['earnings_date'])
+            earn_est = pd.read_csv('data/earnings_estimates.csv', parse_dates=['earnings_date'])
+            income = pd.read_csv('data/quarterly_income.csv', parse_dates=['report_date'])
+            revenue = pd.read_csv('data/quarterly_revenue.csv', parse_dates=['report_date'])
+            rev_est = pd.read_csv('data/revenue_estimates.csv', parse_dates=['next_earnings_date'])
+            growth_est = pd.read_csv('data/growth_estimates.csv')
     except FileNotFoundError as e:
-        print(f"Error loading files: {e}. Ensure all data files for {suffix} exist in the 'data/' folder.")
+        if suffix:
+            print(f"Error loading files: {e}. Ensure all data files for {suffix} exist in the 'data/' folder.")
+        else:
+            print(f"Error loading files: {e}. Ensure all undated data files exist in the 'data/' folder.")
         return pd.DataFrame(), pd.DataFrame()
 
     # --- Combine latest quarterly fundamental data ---
