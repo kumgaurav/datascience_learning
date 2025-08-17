@@ -96,8 +96,8 @@ class ConsistencyCalculator:
             Minimum number of data points required for analysis
         """
         if months == 1:
-            min_data_points = 3  # Relaxed for 1-month
-            logger.info(f"[_get_min_data_points] Using relaxed requirement of {min_data_points} minimum data points for 1-month analysis")
+            min_data_points = 2  # Very relaxed for 1-month - just need start and end point
+            logger.info(f"[_get_min_data_points] Using very relaxed requirement of {min_data_points} minimum data points for 1-month analysis")
         else:
             min_data_points = max(5, months * 5)
             logger.info(f"[_get_min_data_points] Using standard requirement of {min_data_points} minimum data points for {months}-month analysis")
@@ -264,15 +264,24 @@ class ConsistencyCalculator:
         Returns:
             Filtered DataFrame
         """
-        logger.info("[_apply_relaxed_filtering] Using relaxed filtering criteria for 1-month analysis")
+        logger.info("[_apply_relaxed_filtering] Using very relaxed filtering criteria for 1-month analysis")
         
-        # For positive months ratio, only require it to be defined (>= 0)
+        # For 1-month analysis, be very permissive - only exclude extreme outliers
+        before_outlier_filter = len(consistency_df)
+        
+        # Remove only extreme outliers (returns > 1000% or < -95%)
+        consistency_df = consistency_df[consistency_df['total_return'] > -95]
+        consistency_df = consistency_df[consistency_df['total_return'] < 1000]
+        after_outlier_filter = len(consistency_df)
+        
+        # Keep all positive ratios >= 0 (even 0 is acceptable for short term)
         before_months_filter = len(consistency_df)
         consistency_df = consistency_df[consistency_df['positive_months_ratio'] >= 0]
         after_months_filter = len(consistency_df)
         
         logger.info(f"[_apply_relaxed_filtering] Filtering results:")
         logger.info(f"[_apply_relaxed_filtering]   Original candidates: {original_count}")
+        logger.info(f"[_apply_relaxed_filtering]   After outlier filter: {after_outlier_filter} (removed {before_outlier_filter - after_outlier_filter})")
         logger.info(f"[_apply_relaxed_filtering]   After months filter: {after_months_filter} (removed {before_months_filter - after_months_filter})")
         logger.info(f"[_apply_relaxed_filtering]   Final consistent performers: {len(consistency_df)}")
         
@@ -345,45 +354,52 @@ class ConsistencyCalculator:
         try:
             # Add month-year column
             group_data = group_data.copy()
-            group_data['month_year'] = group_data['date'].dt.to_period('M')
             
-            # Group by month and get first/last prices
-            monthly_stats = group_data.groupby('month_year')['close'].agg(['first', 'last', 'count']).reset_index()
-            
-            # Calculate monthly returns (including negative ones for consistency analysis)
-            monthly_stats['monthly_return'] = ((monthly_stats['last'] - monthly_stats['first']) / monthly_stats['first']) * 100
-            
-            # Get the last N months of data based on the specified period
-            monthly_stats = monthly_stats.tail(months)
-            
-            # Prepare return data
-            monthly_returns = monthly_stats['monthly_return'].tolist()
-            
-            # Initialize default values for display based on analysis period
-            display_data = {}
-            
-            # Initialize all possible months
-            for i in range(1, 4):  # Always support up to 3 months
-                display_data[f'month_{i}_pct'] = 0.0
-                display_data[f'month_{i}_name'] = 'N/A'
-                display_data[f'month_{i}_consistent'] = False
-            
-            # Fill in actual values for the specified period
-            for i, (_, row) in enumerate(monthly_stats.iterrows()):
-                month_idx = min(i + 1, 3)  # Cap at 3 months
-                month_key = f'month_{month_idx}_pct'
-                month_name_key = f'month_{month_idx}_name'
-                month_consistent_key = f'month_{month_idx}_consistent'
+            if months == 1:
+                # For 1-month analysis, use weekly periods or overall period return
+                # Since we might be analyzing a partial month or recent days
+                return self._calculate_short_term_consistency(group_data, start_date, end_date)
+            else:
+                # For 2+ months, use the original monthly grouping approach
+                group_data['month_year'] = group_data['date'].dt.to_period('M')
                 
-                return_val = row['monthly_return']
-                display_data[month_key] = return_val
-                display_data[month_name_key] = str(row['month_year'])
-                display_data[month_consistent_key] = return_val > 0  # Positive return = consistent
-            
-            return {
-                'monthly_returns': monthly_returns,
-                'monthly_display': display_data
-            }
+                # Group by month and get first/last prices
+                monthly_stats = group_data.groupby('month_year')['close'].agg(['first', 'last', 'count']).reset_index()
+                
+                # Calculate monthly returns (including negative ones for consistency analysis)
+                monthly_stats['monthly_return'] = ((monthly_stats['last'] - monthly_stats['first']) / monthly_stats['first']) * 100
+                
+                # Get the last N months of data based on the specified period
+                monthly_stats = monthly_stats.tail(months)
+                
+                # Prepare return data
+                monthly_returns = monthly_stats['monthly_return'].tolist()
+                
+                # Initialize default values for display based on analysis period
+                display_data = {}
+                
+                # Initialize all possible months
+                for i in range(1, 4):  # Always support up to 3 months
+                    display_data[f'month_{i}_pct'] = 0.0
+                    display_data[f'month_{i}_name'] = 'N/A'
+                    display_data[f'month_{i}_consistent'] = False
+                
+                # Fill in actual values for the specified period
+                for i, (_, row) in enumerate(monthly_stats.iterrows()):
+                    month_idx = min(i + 1, 3)  # Cap at 3 months
+                    month_key = f'month_{month_idx}_pct'
+                    month_name_key = f'month_{month_idx}_name'
+                    month_consistent_key = f'month_{month_idx}_consistent'
+                    
+                    return_val = row['monthly_return']
+                    display_data[month_key] = return_val
+                    display_data[month_name_key] = str(row['month_year'])
+                    display_data[month_consistent_key] = return_val > 0  # Positive return = consistent
+                
+                return {
+                    'monthly_returns': monthly_returns,
+                    'monthly_display': display_data
+                }
             
         except Exception as e:
             logger.debug(f"Error calculating monthly consistency: {e}")
@@ -398,6 +414,97 @@ class ConsistencyCalculator:
                     'month_3_name': 'N/A',
                     'month_1_consistent': False,
                     'month_2_consistent': False,
+                    'month_3_consistent': False
+                }
+            }
+    
+    def _calculate_short_term_consistency(self, group_data: pd.DataFrame, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
+        """
+        Calculate consistency metrics for short-term (1-month) analysis.
+        Uses weekly periods or overall performance instead of monthly grouping.
+        
+        Args:
+            group_data: DataFrame for a single symbol
+            start_date: Analysis start date
+            end_date: Analysis end date
+            
+        Returns:
+            Dictionary with consistency data adapted for short-term analysis
+        """
+        try:
+            # Sort data by date
+            group_data = group_data.sort_values('date')
+            
+            # Calculate overall return for the period
+            first_price = group_data.iloc[0]['close']
+            last_price = group_data.iloc[-1]['close']
+            overall_return = ((last_price - first_price) / first_price) * 100
+            period_name = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+            
+            # Try to split into weekly periods if we have enough data
+            if len(group_data) >= 10:
+                # Group by week
+                group_data['week'] = group_data['date'].dt.to_period('W')
+                weekly_stats = group_data.groupby('week')['close'].agg(['first', 'last', 'count']).reset_index()
+                weekly_stats['weekly_return'] = ((weekly_stats['last'] - weekly_stats['first']) / weekly_stats['first']) * 100
+                
+                # Use weekly returns as "monthly" returns for consistency calculation
+                period_returns = weekly_stats['weekly_return'].tolist()
+                
+                # For display in 1-month view, show the overall period return instead of weekly slices
+                display_data = {
+                    'month_1_pct': overall_return,
+                    'month_1_name': period_name,
+                    'month_1_consistent': overall_return > 0,
+                    'month_2_pct': 0.0,
+                    'month_2_name': 'N/A',
+                    'month_2_consistent': False,
+                    'month_3_pct': 0.0,
+                    'month_3_name': 'N/A',
+                    'month_3_consistent': False
+                }
+                    
+            else:
+                # Not enough data for weekly analysis, use overall period return
+                period_returns = [overall_return]
+                
+                # Display as single period
+                display_data = {
+                    'month_1_pct': overall_return,
+                    'month_1_name': period_name,
+                    'month_1_consistent': overall_return > 0,
+                    'month_2_pct': 0.0,
+                    'month_2_name': 'N/A',
+                    'month_2_consistent': False,
+                    'month_3_pct': 0.0,
+                    'month_3_name': 'N/A',
+                    'month_3_consistent': False
+                }
+            
+            return {
+                'monthly_returns': period_returns,
+                'monthly_display': display_data
+            }
+            
+        except Exception as e:
+            logger.debug(f"Error in short-term consistency calculation: {e}")
+            # Fallback to overall period return
+            first_price = group_data.iloc[0]['close']
+            last_price = group_data.iloc[-1]['close']
+            overall_return = ((last_price - first_price) / first_price) * 100
+            period_name = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+            
+            return {
+                'monthly_returns': [overall_return],
+                'monthly_display': {
+                    'month_1_pct': overall_return,
+                    'month_1_name': period_name,
+                    'month_1_consistent': overall_return > 0,
+                    'month_2_pct': 0.0,
+                    'month_2_name': 'N/A',
+                    'month_2_consistent': False,
+                    'month_3_pct': 0.0,
+                    'month_3_name': 'N/A',
                     'month_3_consistent': False
                 }
             }

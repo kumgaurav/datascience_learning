@@ -174,13 +174,36 @@ class EarningsStocksTab:
             if earnings_data.empty:
                 return earnings_data
             
-            logger.info(f"[calculate_earnings_metrics] Calculating metrics for {len(earnings_data)} earnings records")
+            logger.info(f"[calculate_earnings_metrics] Processing {len(earnings_data)} earnings records")
+            
+            # Check if volatility metrics are already calculated (from data fetcher)
+            required_columns = ['volatility_score', 'total_return', 'max_daily_gain', 'max_daily_loss', 'volatility_std']
+            has_volatility_metrics = all(col in earnings_data.columns for col in required_columns)
+            
+            if has_volatility_metrics:
+                # Metrics already calculated by data fetcher, no need to recalculate
+                logger.info("[calculate_earnings_metrics] Using pre-calculated volatility metrics from data fetcher")
+                non_zero_returns = len(earnings_data[earnings_data['total_return'] != 0])
+                non_zero_volatility = len(earnings_data[earnings_data['volatility_score'] != 0])
+                logger.info(f"[calculate_earnings_metrics] Found {non_zero_returns} symbols with non-zero returns, {non_zero_volatility} with non-zero volatility")
+                return earnings_data
+            
+            # Fallback: calculate metrics if not already present (shouldn't happen in normal flow)
+            logger.warning("[calculate_earnings_metrics] Volatility metrics missing, calculating them now using earnings-specific method")
             
             # Get symbols for metric calculation
             symbols = earnings_data['symbol'].unique().tolist()
             
-            # Get price data for metrics calculation
-            price_data = self.data_fetcher.get_price_data_for_symbols(symbols, weeks=3)
+            # Get price data for metrics calculation using earnings-specific method (8 weeks for consistency)
+            price_data = self.data_fetcher.get_earnings_price_data_for_symbols(symbols, weeks=8)
+            
+            if price_data.empty:
+                logger.warning("[calculate_earnings_metrics] No price data available, using default values")
+                # Add default metric columns
+                for col in required_columns:
+                    if col not in earnings_data.columns:
+                        earnings_data[col] = 0.0
+                return earnings_data
             
             # Calculate pre-earnings metrics using calculator utility
             metrics_data = self.calculator.calculate_pre_earnings_metrics(price_data, symbols)
@@ -192,7 +215,12 @@ class EarningsStocksTab:
             
         except Exception as e:
             logger.error(f"Error calculating earnings metrics: {e}")
-            raise EarningsCalculationError(f"Failed to calculate earnings metrics: {e}") from e
+            # Ensure default columns exist
+            required_columns = ['volatility_score', 'total_return', 'max_daily_gain', 'max_daily_loss', 'volatility_std']
+            for col in required_columns:
+                if col not in earnings_data.columns:
+                    earnings_data[col] = 0.0
+            return earnings_data
     
     def _filter_by_selected_symbols(self, earnings_data: pd.DataFrame, selected_symbols: List[str]) -> pd.DataFrame:
         """Filter earnings data by selected symbols."""
@@ -310,7 +338,7 @@ class EarningsStocksTab:
         Display symbol selection interface and individual charts for a week.
         
         Args:
-            week_data: DataFrame with week's earnings data
+            week_data: DataFrame with week's earnings data (already filtered by week)
             week_title: Title for the week
             external_selected_symbols: Externally provided selected symbols
             chart_columns: Number of chart columns
@@ -319,13 +347,60 @@ class EarningsStocksTab:
             if week_data.empty:
                 return
             
-            # Get available symbols from week data
+            # Get available symbols from week data (already filtered to specific week)
             available_symbols = week_data['symbol'].tolist()
+            logger.info(f"[_display_symbol_selection_and_charts] Processing {len(available_symbols)} symbols for {week_title}")
             
-            # Display symbol selection interface using UI renderer
-            selected_symbols, chart_columns = self.ui_renderer.display_symbol_selection_interface(
-                available_symbols, default_count=min(10, len(available_symbols)), unique_id=week_title.replace(' ', '_').lower()
+            # Sort symbols by returns (highest first) and select top 25 as default
+            if 'total_return' in week_data.columns:
+                logger.info(f"[_display_symbol_selection_and_charts] Sorting {len(available_symbols)} symbols by returns")
+                
+                # Sort week_data by total_return (highest first)
+                sorted_week_data = week_data.sort_values('total_return', ascending=False)
+                sorted_symbols = sorted_week_data['symbol'].tolist()
+                
+                # Log the sorted order for debugging
+                logger.info("[_display_symbol_selection_and_charts] Top performers by return:")
+                for i, (_, row) in enumerate(sorted_week_data.head(10).iterrows(), 1):
+                    logger.info(f"[_display_symbol_selection_and_charts] {i}. {row['symbol']}: {row['total_return']:.2f}%")
+                
+                # Take top 25 performers as default (or all if less than 25)
+                default_count = min(25, len(sorted_symbols))
+                default_symbols = sorted_symbols[:default_count]
+                
+                logger.info(f"[_display_symbol_selection_and_charts] Selected top {len(default_symbols)} performers as default")
+                
+            else:
+                logger.warning("[_display_symbol_selection_and_charts] total_return column missing, using original order")
+                sorted_symbols = available_symbols
+                default_count = min(10, len(available_symbols))  # Fallback to 10
+                default_symbols = available_symbols[:default_count]
+            
+            # Display symbol selection interface using UI renderer with pre-sorted symbols
+            selected_symbols, chart_columns = self.ui_renderer.display_symbol_selection_interface_with_defaults(
+                available_symbols=sorted_symbols,  # Use sorted order for the dropdown
+                default_symbols=default_symbols,   # Use top performers as defaults
+                unique_id=week_title.replace(' ', '_').lower()
             )
+            
+            # Debug: Log the earnings data being passed to visualizer
+            logger.info(f"[_display_symbol_selection_and_charts] About to create charts for {len(selected_symbols)} symbols")
+            logger.info(f"[_display_symbol_selection_and_charts] Selected symbols: {selected_symbols}")
+            logger.info(f"[_display_symbol_selection_and_charts] Week data shape: {week_data.shape}")
+            
+            if 'total_return' in week_data.columns:
+                logger.info("[_display_symbol_selection_and_charts] Week data contains total_return column")
+                # Show returns for selected symbols
+                for symbol in selected_symbols[:5]:  # Show first 5 for debugging
+                    symbol_data = week_data[week_data['symbol'] == symbol]
+                    if not symbol_data.empty:
+                        return_val = symbol_data['total_return'].iloc[0]
+                        logger.info(f"[_display_symbol_selection_and_charts] {symbol} total_return: {return_val:.2f}%")
+                    else:
+                        logger.warning(f"[_display_symbol_selection_and_charts] {symbol} not found in week_data")
+            else:
+                logger.error("[_display_symbol_selection_and_charts] total_return column MISSING from week_data!")
+                logger.info(f"[_display_symbol_selection_and_charts] Available columns: {list(week_data.columns)}")
             
             # Display individual charts if symbols are selected
             if selected_symbols:
@@ -336,12 +411,12 @@ class EarningsStocksTab:
                 
                 st.info(f"📊 Showing price charts for {len(selected_symbols)} selected symbols")
                 
-                # Get price data for selected symbols
-                price_data = self.data_fetcher.get_cached_price_data_for_symbols(selected_symbols, weeks=3)
+                # Get price data for selected symbols using earnings-specific method (8 weeks)
+                price_data = self.data_fetcher.get_cached_earnings_price_data_for_symbols(selected_symbols, weeks=8)
                 
                 # Create earnings price charts using visualizer utility
                 self.visualizer.create_earnings_price_charts(
-                    price_data, selected_symbols, chart_columns, weeks=3, earnings_data=week_data
+                    price_data, selected_symbols, chart_columns, weeks=8, earnings_data=week_data
                 )
             else:
                 st.info("👆 Select one or more symbols above to view detailed price charts")

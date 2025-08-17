@@ -306,9 +306,19 @@ class ConsistencyDataFetcher:
             Start date for the analysis period
         """
         if months == 1:
-            # Use current month from start to now
-            start_date = datetime(end_date.year, end_date.month, 1)
-            logger.info(f"[_calculate_date_range] Using current month boundaries for 1-month analysis: {start_date.date()} to {end_date.date()}")
+            # For 1-month analysis, ensure we have at least 10 trading days of data
+            # Start from current month beginning, but fallback to last 15 days if needed
+            current_month_start = datetime(end_date.year, end_date.month, 1)
+            days_in_current_month = (end_date - current_month_start).days
+            
+            if days_in_current_month >= 10:
+                # Sufficient days in current month
+                start_date = current_month_start
+                logger.info(f"[_calculate_date_range] Using current month boundaries for 1-month analysis: {start_date.date()} to {end_date.date()}")
+            else:
+                # Not enough days in current month, use last 15 calendar days instead
+                start_date = end_date - timedelta(days=15)
+                logger.info(f"[_calculate_date_range] Insufficient current month data, using last 15 days for 1-month analysis: {start_date.date()} to {end_date.date()}")
         else:
             # For 2+ months, use the previous approach but more accurate
             start_date = end_date - timedelta(days=30*months)

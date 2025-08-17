@@ -5,8 +5,8 @@ Handles all database connections and operations.
 """
 
 import pandas as pd
-import mysql.connector
-from mysql.connector import Error
+import pymysql
+from pymysql import MySQLError as Error
 import configparser
 import os
 import logging
@@ -51,7 +51,7 @@ class DatabaseManager:
         """Test database connection"""
         try:
             connection = self._get_connection()
-            if connection and connection.is_connected():
+            if connection:
                 logger.info("Database connection test successful")
                 connection.close()
                 return True
@@ -65,14 +65,13 @@ class DatabaseManager:
         """Get database connection"""
         try:
             db_config = self.config['mysql']
-            connection = mysql.connector.connect(
+            connection = pymysql.connect(
                 host=db_config.get('url', 'localhost'),
                 port=db_config.getint('port', 3306),
-                database=db_config.get('database', 'stocksdb'),
+                db=db_config.get('database', 'stocksdb'),
                 user=db_config.get('username', 'root'),
                 password=db_config.get('password', ''),
                 charset=db_config.get('charset', 'utf8mb4'),
-                use_unicode=True,
                 autocommit=True
             )
             return connection
@@ -137,7 +136,7 @@ class DatabaseManager:
                     sd.industry,
                     sd.market_cap
                 FROM stocksdb.stock_change_tracker sct
-                LEFT JOIN stocksdb.stocks_earnings se ON sct.symbol = se.symbol
+                LEFT JOIN stocksdb.stocks_earnings se ON (sct.symbol COLLATE utf8mb4_0900_ai_ci) = (se.ticker COLLATE utf8mb4_0900_ai_ci)
                 LEFT JOIN stocksdb.stock_details sd ON sct.symbol = sd.symbol
             """
             
@@ -221,7 +220,7 @@ class DatabaseManager:
                     sd.industry,
                     sd.market_cap
                 FROM stocksdb.stock_change_tracker sct
-                LEFT JOIN stocksdb.stocks_earnings se ON sct.symbol = se.symbol
+                LEFT JOIN stocksdb.stocks_earnings se ON (sct.symbol COLLATE utf8mb4_0900_ai_ci) = (se.ticker COLLATE utf8mb4_0900_ai_ci)
                 LEFT JOIN stocksdb.stock_details sd ON sct.symbol = sd.symbol
                 WHERE sct.symbol = %(symbol)s
             """
@@ -286,7 +285,7 @@ class DatabaseManager:
         """Get current database connection status"""
         try:
             connection = self._get_connection()
-            if connection and connection.is_connected():
+            if connection:
                 connection.close()
                 return {
                     'status': 'Connected', 

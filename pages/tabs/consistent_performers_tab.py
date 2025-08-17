@@ -136,7 +136,12 @@ class ConsistentPerformersTab:
         
         with tab3:
             st.markdown("### 🏆 Top 25 Most Consistent Performers - Current Month")
-            st.caption("Short-term consistency analysis using current month performance")
+            st.caption("Short-term consistency analysis using current month or recent trading days performance")
+            
+            # Add helpful info for current month tab
+            if datetime.now().day <= 10:
+                st.info("📅 **Note**: Since we're early in the month, this analysis may include data from recent trading days to ensure meaningful results.")
+            
             self._render_period_analysis(1, symbol, selected_symbols, chart_columns, None, debug_mode)
         
         with tab4:

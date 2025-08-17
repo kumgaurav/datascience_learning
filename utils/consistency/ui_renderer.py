@@ -58,12 +58,13 @@ class ConsistencyUIRenderer:
             current_month = datetime.now().strftime('%Y-%m')
             debug_info += f"""
             
-            **📅 1-Month Analysis Details:**
+            **📅 1-Month Analysis Details (UPDATED IMPLEMENTATION):**
             - Current month: {current_month}
-            - Date range method: Using current month boundaries instead of last 30 days
-            - Minimum data points: 3 (relaxed from 5 for current month analysis)
-            - Filtering: Relaxed - allows negative returns, only requires defined positive ratio
-            - Why limited results: Early in month = fewer trading days = fewer qualifying stocks
+            - Date range method: ✅ FIXED - Smart fallback to last 15 days if insufficient current month data
+            - Minimum data points: ✅ FIXED - Reduced to 2 (just start/end price needed)
+            - Filtering: ✅ FIXED - Very relaxed - allows negative returns, only excludes extreme outliers
+            - Consistency calculation: ✅ FIXED - Uses weekly periods or overall period return instead of monthly grouping
+            - Fallback logic: ✅ ADDED - Switches to recent trading days when current month data is insufficient
             """
             
             # Show breakdown of the results

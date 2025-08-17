@@ -1,5 +1,4 @@
 import configparser
-import mysql.connector
 import pymysql
 from sqlalchemy import create_engine
 import pandas as pd
@@ -85,13 +84,14 @@ class DatabaseManager:
     def get_mysql_connection(_self):
         """Get MySQL connection with caching"""
         try:
-            connection = mysql.connector.connect(
+            connection = pymysql.connect(
                 host=_self.mysql_config['host'],
                 user=_self.mysql_config['user'],
                 password=_self.mysql_config['password'],
                 database=_self.mysql_config['database'],
                 port=_self.mysql_config['port'],
-                charset=_self.mysql_config['charset']
+                charset=_self.mysql_config['charset'],
+                autocommit=True
             )
             return connection
         except Exception as e:
@@ -219,7 +219,7 @@ class DatabaseManager:
                 sct.change_in_percent, 
                 se.earnings_date as earning_date
             FROM {full_tracker_table} sct
-            LEFT JOIN {full_earnings_table} se ON sct.symbol = se.symbol
+            LEFT JOIN {full_earnings_table} se ON (sct.symbol COLLATE utf8mb4_0900_ai_ci) = (se.ticker COLLATE utf8mb4_0900_ai_ci)
             {where_clause}
             ORDER BY sct.change_in_percent DESC
             LIMIT {page_size} OFFSET {offset}
@@ -417,7 +417,7 @@ class DatabaseManager:
             SELECT COUNT(*) as total_records, 
                    COUNT(se.earnings_date) as records_with_earnings
             FROM {full_tracker_table} sct
-            LEFT JOIN {full_earnings_table} se ON sct.symbol = se.symbol
+            LEFT JOIN {full_earnings_table} se ON sct.symbol = se.ticker
             """
             
             result = pd.read_sql_query(test_query, engine)
