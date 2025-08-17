@@ -93,7 +93,7 @@ def calculate_risk_score(row):
     return min(risk_score, 100)  # Cap at 100
 
 
-def diversify_portfolio(stocks_df, max_per_sector=3, max_per_industry=2):
+def diversify_portfolio(stocks_df, max_per_sector=3, max_per_industry=2, limit=None):
     """
     Diversify the portfolio by limiting exposure per sector/industry.
     """
@@ -121,13 +121,13 @@ def diversify_portfolio(stocks_df, max_per_sector=3, max_per_industry=2):
         sector_counts[sector] = sector_counts.get(sector, 0) + 1
         industry_counts[industry] = industry_counts.get(industry, 0) + 1
         
-        if len(diversified_stocks) >= 20:  # Stop at 20 stocks
+        if limit is not None and len(diversified_stocks) >= int(limit):
             break
     
     return pd.DataFrame(diversified_stocks)
 
 
-def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True):
+def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True, verbose=False, bullish_only=True):
     """
     Loads the latest features, makes predictions, and ranks stocks to find the top n.
 
@@ -141,8 +141,8 @@ def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True):
         pd.DataFrame: A DataFrame of the top n ranked stocks, or an empty DataFrame if an error occurs.
     """
     # --- 1. Load Model and Features ---
-    model_path = os.path.join('models', 'stock_predictor.joblib')
-    feature_path = 'data/featured_stocks.csv'
+    model_path = os.path.join('models', 'stock_predictor_top.joblib')
+    feature_path = 'data/featured_stocks_top.csv'
 
     try:
         model = joblib.load(model_path)
@@ -153,17 +153,19 @@ def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True):
         return pd.DataFrame()
 
     # Check for NaN values before cleaning
-    print(f"Data shape before cleaning: {features_df.shape}")
-    print(f"NaN counts per column:")
-    for col in features_df.columns:
-        nan_count = features_df[col].isna().sum()
-        if nan_count > 0:
-            print(f"  {col}: {nan_count} NaN values")
+    if verbose:
+        print(f"Data shape before cleaning: {features_df.shape}")
+        print(f"NaN counts per column:")
+        for col in features_df.columns:
+            nan_count = features_df[col].isna().sum()
+            if nan_count > 0:
+                print(f"  {col}: {nan_count} NaN values")
     
     # Fill NaN values instead of dropping rows
     features_df.fillna(0, inplace=True)
     
-    print(f"Data shape after cleaning: {features_df.shape}")
+    if verbose:
+        print(f"Data shape after cleaning: {features_df.shape}")
     if features_df.empty:
         print("No data available for prediction after cleaning.")
         return pd.DataFrame()
@@ -171,23 +173,25 @@ def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True):
     # --- 2. Make Predictions ---
     # Prepare the feature set for prediction (must match the columns used in training)
     training_cols = model.get_booster().feature_names
-    print(f"Model expects these features: {training_cols}")
-    print(f"Available columns: {list(features_df.columns)}")
+    if verbose:
+        print(f"Model expects these features: {training_cols}")
+        print(f"Available columns: {list(features_df.columns)}")
     
     # Check which training columns are available
     available_cols = [col for col in training_cols if col in features_df.columns]
     missing_cols = [col for col in training_cols if col not in features_df.columns]
     
     if missing_cols:
-        print(f"Warning: Missing columns: {missing_cols}")
-        print("Filling missing columns with 0...")
+        if verbose:
+            print(f"Warning: Missing columns: {missing_cols}")
+            print("Filling missing columns with 0...")
         for col in missing_cols:
             features_df[col] = 0
     
     X_predict = features_df[training_cols]
     
-    predictions = model.predict(X_predict)
-    features_df['predicted_change'] = predictions
+    # Model predicts 5-day percentage change (pct), not absolute change
+    predictions_pct = model.predict(X_predict)
     
     # --- 3. Calculate Predicted Return % ---
     # Use 'close' column instead of 'price'
@@ -199,7 +203,9 @@ def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True):
         print("Error: No price column found")
         return pd.DataFrame()
     
-    features_df['predicted_return_pct'] = (features_df['predicted_change'] / features_df[price_col]) * 100
+    features_df['predicted_return_pct'] = predictions_pct
+    # Also compute absolute predicted change in dollars for display
+    features_df['predicted_change'] = (features_df['predicted_return_pct'] / 100.0) * features_df[price_col]
     
     # --- 4. Calculate Confidence and Risk Scores ---
     features_df['confidence_score'] = features_df.apply(calculate_confidence_score, axis=1)
@@ -207,24 +213,37 @@ def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True):
     
     # --- 5. Apply Filters ---
     # Filter by confidence and risk
-    filtered_stocks = features_df[
+    filter_mask = (
         (features_df['confidence_score'] >= min_confidence) &
         (features_df['risk_score'] <= max_risk) &
-        (features_df['predicted_change'] > 0)  # Only positive predictions
-    ].copy()
+        (features_df['predicted_change'] > 0)
+    )
+    if bullish_only:
+        bull_mask = (
+            features_df.get('broke_resistance', False).astype(bool) |
+            features_df.get('post_earnings_dip_rally', False).astype(bool) |
+            features_df.get('breakout_confirmed', False).astype(bool) |
+            features_df.get('strong_momentum', False).astype(bool)
+        )
+        filter_mask = filter_mask & bull_mask
+    filtered_stocks = features_df[filter_mask].copy()
     
-    print(f"Stocks after confidence/risk filtering: {len(filtered_stocks)}")
+    if verbose:
+        print(f"Stocks after confidence/risk filtering: {len(filtered_stocks)}")
     
     if filtered_stocks.empty:
-        print("No stocks passed the confidence/risk filters. Relaxing constraints...")
+        if verbose:
+            print("No stocks passed the confidence/risk filters. Relaxing constraints...")
         # Relax constraints
         filtered_stocks = features_df[
             (features_df['predicted_change'] > 0)  # Only positive predictions
         ].copy()
-        print(f"Stocks with positive predictions: {len(filtered_stocks)}")
+        if verbose:
+            print(f"Stocks with positive predictions: {len(filtered_stocks)}")
     
     if filtered_stocks.empty:
-        print("No stocks with positive predictions. Showing all stocks...")
+        if verbose:
+            print("No stocks with positive predictions. Showing all stocks...")
         filtered_stocks = features_df.copy()
     
     # --- 6. Calculate Composite Score ---
@@ -236,18 +255,22 @@ def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True):
     )
     
     # --- 7. Apply Diversification ---
+    # --- 7. Apply Diversification (only if it would reduce the set) ---
     if diversify and len(filtered_stocks) > n:
-        filtered_stocks = diversify_portfolio(filtered_stocks)
+        filtered_stocks = diversify_portfolio(filtered_stocks, limit=n)
     
     # --- 8. Rank and Select Top N ---
-    # Sort by composite score in descending order
     ranked_stocks = filtered_stocks.sort_values('composite_score', ascending=False)
-    
-    # Remove duplicate tickers (keep the first occurrence with highest score)
     ranked_stocks = ranked_stocks.drop_duplicates(subset=['ticker'], keep='first')
-    
-    # Select the top N stocks
     top_n_stocks = ranked_stocks.head(n)
+
+    # If fewer than n after filters/diversification, backfill from remainder by predicted return (ignoring bullish/risk constraints)
+    if len(top_n_stocks) < n:
+        remaining = features_df[~features_df['ticker'].isin(top_n_stocks['ticker'])].copy()
+        remaining = remaining.sort_values('predicted_return_pct', ascending=False)
+        need = n - len(top_n_stocks)
+        backfill = remaining.head(need)
+        top_n_stocks = pd.concat([top_n_stocks, backfill], ignore_index=True)
     
     # Debug: Check for duplicates
     if len(top_n_stocks) != len(top_n_stocks['ticker'].unique()):
@@ -268,13 +291,13 @@ def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True):
         'strong_momentum',
         'breakout_confirmed',
         'earnings_in_3_weeks',
-        'trend_slope_15d',
+        'trend_slope_15d', 'trend_slope_30d',
         'rsi_14d',
         'volume_ratio',
         'volatility_30d',
         'momentum_5d',
         'momentum_10d',
-        'momentum_20d'
+        'momentum_20d', 'momentum_30d', 'momentum_60d', 'up_day_ratio_20d', 'momentum_winner', 'trend_persistence_20d'
     ]
     
     # Add sector/industry if available
@@ -286,10 +309,11 @@ def get_top_stocks(n=20, min_confidence=30, max_risk=70, diversify=True):
     # Ensure all display columns exist before trying to select them
     final_cols = [col for col in display_cols if col in top_n_stocks.columns]
     
-    print(f"Found and ranked {len(top_n_stocks)} top stocks.")
-    print(f"Average confidence score: {top_n_stocks['confidence_score'].mean():.1f}")
-    print(f"Average risk score: {top_n_stocks['risk_score'].mean():.1f}")
-    print(f"Average predicted return: {top_n_stocks['predicted_return_pct'].mean():.2f}%")
+    if verbose:
+        print(f"Found and ranked {len(top_n_stocks)} top stocks.")
+        print(f"Average confidence score: {top_n_stocks['confidence_score'].mean():.1f}")
+        print(f"Average risk score: {top_n_stocks['risk_score'].mean():.1f}")
+        print(f"Average predicted return: {top_n_stocks['predicted_return_pct'].mean():.2f}%")
     
     return top_n_stocks[final_cols]
 

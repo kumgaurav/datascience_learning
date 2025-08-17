@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from stock_selector import get_top_stocks, get_stock_analysis, calculate_confidence_score, calculate_risk_score
+from stock_selector_v2 import get_top_stocks, get_stock_analysis
+from stock_selector import calculate_confidence_score, calculate_risk_score
 from chatbot import create_chatbot_agent
 import os
 import joblib
@@ -220,6 +221,8 @@ else:
     3. Restart the app
     """)
 
+# (Momentum Winners sidebar removed; now available as its own page under left navigation)
+
 # --- App Title ---
 st.title("📈 AI-Powered Stock Screener Pro")
 st.write("Advanced stock analysis using XGBoost, technical indicators, and fundamental data.")
@@ -329,7 +332,8 @@ if not st.session_state.top_stocks_df.empty:
     
     # Load historical price data
     try:
-        stock_data = pd.read_csv('data/stock_prices_2024-06-01.csv')
+        stock_prices_path = os.getenv('STOCK_PRICES_CSV', 'data/stock_prices.csv')
+        stock_data = pd.read_csv(stock_prices_path)
         st.success("✅ Historical price data loaded successfully")
         
         # Create stock selector
@@ -344,7 +348,8 @@ if not st.session_state.top_stocks_df.empty:
         if selected_ticker:
             # Load complete featured data to get all technical indicators
             try:
-                complete_featured_data = pd.read_csv('data/featured_stocks.csv')
+                featured_stocks_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
+                complete_featured_data = pd.read_csv(featured_stocks_path)
                 stock_featured_data = complete_featured_data[complete_featured_data['ticker'] == selected_ticker].iloc[0]
                 
                 # Get predicted return and confidence data from filtered stocks if available
@@ -866,7 +871,8 @@ if not st.session_state.top_stocks_df.empty:
                 
                 # Load earnings history data
                 try:
-                    earnings_data = pd.read_csv('data/earnings_history_2024-06-01.csv')
+                    earnings_history_path = os.getenv('EARNINGS_HISTORY_CSV', 'data/earnings_history.csv')
+                    earnings_data = pd.read_csv(earnings_history_path)
                     earnings_ticker_data = earnings_data[earnings_data['ticker'] == selected_ticker]
                     
                     if not earnings_ticker_data.empty:
@@ -981,7 +987,7 @@ if not st.session_state.top_stocks_df.empty:
                         st.info(f"Available tickers in earnings data: {', '.join(available_tickers)}")
                 except Exception as e:
                     st.error(f"Error loading earnings data: {str(e)}")
-                    st.info("Make sure the earnings_history_2024-06-01.csv file is available in the data folder.")
+                    st.info("Make sure the earnings_history.csv file is available in the data folder.")
                 
                 resistance_level = stock_featured_data.get('resistance_20d')
                 current_price = stock_featured_data['close']
@@ -1252,7 +1258,7 @@ if not st.session_state.top_stocks_df.empty:
     # --- Visualizations ---
     st.header("📈 Portfolio Analysis")
     
-    # Create tabs for different visualizations
+    # Create tabs for different visualizations (Momentum Winners moved to its own page)
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Stock Rankings", "🎯 Risk vs Return", "📈 Technical Signals", "🏢 Sector Analysis"])
     
     with tab1:
@@ -1271,16 +1277,22 @@ if not st.session_state.top_stocks_df.empty:
     
     with tab2:
         # Risk vs Return scatter plot
+        _df_plot = st.session_state.top_stocks_df.copy()
+        # Plotly marker sizes must be non-negative
+        if 'confidence_score' in _df_plot.columns:
+            _df_plot['confidence_size'] = _df_plot['confidence_score'].abs()
+        else:
+            _df_plot['confidence_size'] = 0.0
         fig = px.scatter(
-            st.session_state.top_stocks_df,
+            _df_plot,
             x='risk_score',
             y='predicted_return_pct',
-            size='confidence_score',
+            size='confidence_size',
             color='composite_score',
             hover_data=['ticker'],
             title="Risk vs Return Analysis",
             labels={'risk_score': 'Risk Score', 'predicted_return_pct': 'Predicted Return (%)', 
-                   'confidence_score': 'Confidence Score', 'composite_score': 'Composite Score'}
+                   'confidence_size': 'Confidence (|score|)', 'composite_score': 'Composite Score'}
         )
         fig.update_layout(height=500)
         st.plotly_chart(fig, use_container_width=True)
@@ -1362,8 +1374,49 @@ if not st.session_state.top_stocks_df.empty:
     df_to_display['risk_score'] = df_to_display['risk_score'].apply(lambda x: f"{x:.1f}")
     df_to_display['composite_score'] = df_to_display['composite_score'].apply(lambda x: f"{x:.1f}")
     
-    # Display the table
-    st.dataframe(df_to_display, use_container_width=True, hide_index=True)
+    # Highlight rows also present in Momentum page (green background)
+    try:
+        momentum_path = os.getenv('FEATURED_STOCKS_MOMENTUM_CSV', 'data/featured_stocks_momentum.csv')
+        mom_df = pd.read_csv(momentum_path)
+        # Build winners like the Momentum page
+        for col in ['momentum_30d','momentum_60d','trend_slope_15d','ma_20','macd','macd_signal','close']:
+            if col in mom_df.columns:
+                mom_df[col] = pd.to_numeric(mom_df[col], errors='coerce')
+        if 'momentum_winner' in mom_df.columns and mom_df['momentum_winner'].notna().any():
+            mask = mom_df['momentum_winner'] == True
+        else:
+            mask = (
+                ((mom_df.get('momentum_60d', 0) > 0.5) | (mom_df.get('momentum_30d', 0) > 0.2)) &
+                (mom_df.get('trend_slope_15d', 0) > 0) &
+                (mom_df.get('close', 0) > mom_df.get('ma_20', 0)) &
+                (mom_df.get('macd', 0) > mom_df.get('macd_signal', 0))
+            )
+        winners = mom_df[mask].copy()
+        # Score and take top 20
+        if not winners.empty:
+            def _mw_score(row):
+                m60 = row.get('momentum_60d', 0) if pd.notna(row.get('momentum_60d', 0)) else 0
+                m30 = row.get('momentum_30d', 0) if pd.notna(row.get('momentum_30d', 0)) else 0
+                slope30 = row.get('trend_slope_30d', 0) if 'trend_slope_30d' in winners.columns else 0
+                slope30 = slope30 if pd.notna(slope30) else 0
+                return 0.6*m60 + 0.3*m30 + 0.1*slope30
+            winners['mw_score'] = winners.apply(_mw_score, axis=1)
+            winners = winners.sort_values('mw_score', ascending=False).head(20)
+        momentum_tickers = set(winners['ticker'].astype(str).str.upper()) if not winners.empty else set()
+    except Exception:
+        momentum_tickers = set()
+
+    def _highlight_momentum(row):
+        t = str(row.get('ticker', '')).upper()
+        color = '#e6ffed' if t in momentum_tickers else ''
+        return [f'background-color: {color}'] * len(row)
+
+    try:
+        styled = df_to_display.style.apply(_highlight_momentum, axis=1)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    except Exception:
+        # Fallback without styling
+        st.dataframe(df_to_display, use_container_width=True, hide_index=True)
     
     # --- Export Options ---
     st.header("💾 Export Options")
@@ -1465,6 +1518,8 @@ else:
         st.write("• **Risk Metrics**: Volatility, drawdown, Value at Risk")
         st.write("• **AI Chatbot**: Ask questions about recommendations")
 
+## (Momentum Winners detailed section removed; available on its own page)
+
 # --- Symbol Analysis Section (Always Available) ---
 st.header("🔍 Individual Symbol Analysis")
 st.write("Enter any stock symbol to analyze its current metrics and understand why it was or wasn't selected as a top pick.")
@@ -1481,7 +1536,8 @@ if analyze_button and symbol_input:
     
     # Load the featured data to get all available symbols
     try:
-        featured_data = pd.read_csv('data/featured_stocks.csv')
+        featured_stocks_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
+        featured_data = pd.read_csv(featured_stocks_path)
         symbol_data = featured_data[featured_data['ticker'] == symbol_input]
         
         if symbol_data.empty:
@@ -1519,6 +1575,17 @@ if analyze_button and symbol_input:
                     st.metric("10-Day Momentum", f"{stock_data['momentum_10d']:.3f}")
                 with col3:
                     st.metric("20-Day Momentum", f"{stock_data['momentum_20d']:.3f}")
+                # Extended momentum
+                col1, col2, col3 = st.columns(3)
+                if 'momentum_30d' in stock_data.index:
+                    with col1:
+                        st.metric("30-Day Momentum", f"{stock_data['momentum_30d']:.3f}")
+                if 'momentum_60d' in stock_data.index:
+                    with col2:
+                        st.metric("60-Day Momentum", f"{stock_data['momentum_60d']:.3f}")
+                if 'up_day_ratio_20d' in stock_data.index:
+                    with col3:
+                        st.metric("Up-Day Ratio (20d)", f"{stock_data['up_day_ratio_20d']*100:.1f}%")
                 
                 # Display prediction results
                 st.subheader("🎯 Model Prediction Results")
@@ -1549,28 +1616,27 @@ if analyze_button and symbol_input:
                     
                     # Calculate what the prediction would be
                     try:
-                        # Get model predictions for this symbol
-                        model = joblib.load('models/stock_predictor.joblib')
-                        
-                        # Prepare features for prediction
-                        feature_cols = ['ma_20', 'ma_50', 'volatility_30d', 'rsi_14d', 'macd', 'macd_signal', 
-                                      'macd_histogram', 'bb_upper', 'bb_middle', 'bb_lower', 'bb_position', 
-                                      'volume_ma_20', 'volume_ratio', 'pvt', 'obv', 'rolling_max', 'drawdown_30d', 
-                                      'var_95_30d', 'sharpe_ratio', 'trend_5d', 'trend_10d', 'trend_20d', 
-                                      'trend_50d', 'trend_strength', 'momentum_5d', 'momentum_10d', 'momentum_20d', 
-                                      'golden_cross', 'death_cross', 'support_20d', 'resistance_20d', 
-                                      'distance_from_support', 'distance_from_resistance', 'breakout_strength', 
-                                      'trend_slope_15d', 'broke_resistance']
-                        
-                        # Get features for this symbol
-                        symbol_features = stock_data[feature_cols].fillna(0)
-                        
-                        # Make prediction
-                        predicted_change_pct = model.predict([symbol_features])[0]
-                        predicted_return_pct = predicted_change_pct
-                        
-                        st.metric("Model Prediction", f"{predicted_return_pct:.2f}%", 
-                                delta=f"{predicted_return_pct:.2f}%")
+                        # Get model predictions for this symbol (Top Stocks model)
+                        model = joblib.load('models/stock_predictor_top.joblib')
+                        # Use the model's expected training columns
+                        training_cols = model.get_booster().feature_names
+                        # Build a single-row feature frame matching the model schema
+                        row_dict = {}
+                        for col in training_cols:
+                            val = stock_data.get(col, 0)
+                            try:
+                                val = float(val)
+                            except Exception:
+                                val = 0.0
+                            row_dict[col] = val
+                        import pandas as _pd_alias  # local alias to avoid shadowing
+                        X_symbol = _pd_alias.DataFrame([row_dict])
+
+                        # Make prediction (percentage over ~5 trading days)
+                        predicted_return_pct = float(model.predict(X_symbol)[0])
+
+                        st.metric("Model Prediction", f"{predicted_return_pct:.2f}%",
+                                  delta=f"{predicted_return_pct:.2f}%")
                         
                         # Calculate confidence and risk scores
                         confidence_score = calculate_confidence_score(stock_data)

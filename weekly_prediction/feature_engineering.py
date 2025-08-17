@@ -80,7 +80,7 @@ def _calculate_advanced_trend_indicators(df):
     df['trend_strength'] = abs(df['trend_20d'])
     
     # Price momentum across timeframes
-    for period in [5, 10, 20]:
+    for period in [5, 10, 20, 30, 60]:
         df[f'momentum_{period}d'] = df['close'].pct_change(periods=period)
     
     # Golden/Death cross detection
@@ -206,6 +206,18 @@ def _calculate_momentum(df):
                   for y in ticker_df[price_col].rolling(window=window)]
         ticker_df['trend_slope_15d'] = slopes
 
+        # 30d trend slope
+        window_30 = 30
+        x_30 = np.arange(window_30)
+        slopes_30 = [np.polyfit(x_30, y, 1)[0] if len(y.dropna()) == window_30 else np.nan 
+                     for y in ticker_df[price_col].rolling(window=window_30)]
+        ticker_df['trend_slope_30d'] = slopes_30
+
+        # Up-day ratio over last 20 trading days
+        daily_returns = ticker_df[price_col].pct_change()
+        ticker_df['return_1d'] = daily_returns
+        ticker_df['up_day_ratio_20d'] = daily_returns.rolling(window=20).apply(lambda r: np.mean(r > 0), raw=False)
+
         # 1. Define resistance as the highest price over the last 50 days, excluding today.
         # We use .shift(1) to ensure we're comparing today's price to PAST resistance.
         resistance_50d = ticker_df[price_col].rolling(window=50).max().shift(1)
@@ -213,8 +225,55 @@ def _calculate_momentum(df):
         # 2. The 'broke_resistance' flag is True if the current price is above that past high.
         ticker_df['broke_resistance'] = ticker_df[price_col] > resistance_50d
 
+        # Days since last broke_resistance
+        days_since = []
+        last_true_idx = None
+        for idx, val in ticker_df['broke_resistance'].reset_index(drop=True).items():
+            if bool(val):
+                last_true_idx = idx
+                days_since.append(0)
+            else:
+                days_since.append(idx - last_true_idx if last_true_idx is not None else np.nan)
+        ticker_df['days_since_last_broke_resistance'] = days_since
+
+        # --- ATR (Average True Range) 14d ---
+        prev_close = ticker_df[price_col].shift(1)
+        tr1 = ticker_df['high'] - ticker_df['low']
+        tr2 = (ticker_df['high'] - prev_close).abs()
+        tr3 = (ticker_df['low'] - prev_close).abs()
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        ticker_df['atr_14d'] = true_range.rolling(window=14).mean()
+        ticker_df['atr_pct'] = ticker_df['atr_14d'] / ticker_df[price_col]
+
+        # --- Volume spike (z-score over 20d) ---
+        vol_mean_20 = ticker_df['volume'].rolling(window=20).mean()
+        vol_std_20 = ticker_df['volume'].rolling(window=20).std()
+        ticker_df['volume_zscore_20'] = (ticker_df['volume'] - vol_mean_20) / vol_std_20
+        ticker_df['volume_spike'] = ticker_df['volume_zscore_20'] > 2.0
+
+        # --- Gap analysis ---
+        gap_pct = (ticker_df['open'] - prev_close) / prev_close
+        ticker_df['gap_pct'] = gap_pct
+        ticker_df['gap_up_2pct'] = gap_pct > 0.02
+        ticker_df['gap_down_2pct'] = gap_pct < -0.02
+
         df_out = pd.concat([df_out, ticker_df])
         
+    # Cross-sectional relative strength vs median momentum on each date
+    if not df_out.empty and 'momentum_20d' in df_out.columns:
+        date_median = df_out.groupby('date')['momentum_20d'].median().rename('momentum_20d_median')
+        df_out = df_out.merge(date_median, on='date', how='left')
+        df_out['relative_strength_20d'] = df_out['momentum_20d'] - df_out['momentum_20d_median']
+        df_out.drop(columns=['momentum_20d_median'], inplace=True)
+    else:
+        df_out['relative_strength_20d'] = 0
+
+    # Volatility-adjusted momentum
+    if 'momentum_20d' in df_out.columns and 'volatility_30d' in df_out.columns:
+        df_out['vol_adj_momentum_20d'] = df_out['momentum_20d'] / (df_out['volatility_30d'] + 1e-6)
+    else:
+        df_out['vol_adj_momentum_20d'] = 0
+
     return df_out
 
 
@@ -238,7 +297,7 @@ def _calculate_earnings_surprise_enhanced(master_df):
     return master_df
 
 
-def create_all_features(master_df, prices_df, today=date(2024, 6, 1)):
+def create_all_features(master_df, prices_df, today=date.today()):
     """
     Creates a rich set of features for each stock.
 
@@ -292,8 +351,38 @@ def create_all_features(master_df, prices_df, today=date(2024, 6, 1)):
 
     # Continuous upward movement (using the trend slope we calculated)
     featured_df['is_upward_trending'] = featured_df['trend_slope_15d'] > 0
+    # Trend persistence signal
+    featured_df['trend_persistence_20d'] = featured_df.get('up_day_ratio_20d', 0) > 0.55
     
     # 4. Add missing features based on requirements
+    # Days since last earnings if available
+    if 'earnings_date' in featured_df.columns:
+        try:
+            featured_df['days_since_last_earnings'] = (pd.to_datetime(today) - pd.to_datetime(featured_df['earnings_date'])).dt.days
+        except Exception:
+            featured_df['days_since_last_earnings'] = 0
+    else:
+        featured_df['days_since_last_earnings'] = 0
+
+    # Weighted confidence score as meta-feature (similar to selector)
+    def _weighted_confidence(row):
+        score = 0.0
+        score += 20.0 if bool(row.get('broke_resistance', False)) else 0.0
+        score += 15.0 if bool(row.get('post_earnings_dip_rally', False)) else 0.0
+        score += 10.0 if bool(row.get('strong_momentum', False)) else 0.0
+        score += 10.0 if bool(row.get('breakout_confirmed', False)) else 0.0
+        score += 5.0 if bool(row.get('golden_cross', False)) else 0.0
+        score += 15.0 if bool(row.get('earnings_in_3_weeks', False)) else 0.0
+        score += 10.0 if bool(row.get('last_2q_positive_surprises', False)) else 0.0
+        score += 10.0 if bool(row.get('bullish_momentum', False)) else 0.0
+        score += 10.0 if bool(row.get('risk_adjusted_momentum', False)) else 0.0
+        score += 5.0 if float(row.get('sharpe_ratio', 0)) > 0.5 else 0.0
+        score += 5.0 if float(row.get('volatility_30d', 1)) < 0.3 else 0.0
+        score += 5.0 if float(row.get('volume_ratio', 0)) > 1.2 else 0.0
+        score += 5.0 if float(row.get('bb_position', 0)) > 0.7 else 0.0
+        return min(score, 100.0)
+
+    featured_df['weighted_confidence_score'] = featured_df.apply(_weighted_confidence, axis=1)
     
     # Feature 1: Earnings in next 3 weeks (already implemented above)
     
@@ -339,6 +428,17 @@ def create_all_features(master_df, prices_df, today=date(2024, 6, 1)):
         (featured_df['volatility_30d'] < 0.3) &  # Low volatility
         (featured_df['sharpe_ratio'] > 0.5)  # Good risk-adjusted returns
     )
+
+    # Momentum winner: persistent multi-week trend, supportive signals
+    featured_df['momentum_winner'] = (
+        (
+            (featured_df.get('momentum_60d', 0) > 0.5) |
+            (featured_df.get('momentum_30d', 0) > 0.2)
+        ) &
+        (featured_df['is_upward_trending']) &
+        (featured_df['close'] > featured_df['ma_20']) &
+        ((featured_df['macd'] > featured_df['macd_signal']) | (featured_df.get('golden_cross', False)))
+    )
     
     # Breakout confirmation
     featured_df['breakout_confirmed'] = (
@@ -350,13 +450,15 @@ def create_all_features(master_df, prices_df, today=date(2024, 6, 1)):
     # Keep all columns and add missing ones with defaults
     all_possible_cols = [
         'ticker', 'close', 'volume', 'ma_20', 'ma_50', 'volatility_30d', 'rsi_14d',
-        'trend_slope_15d', 'broke_resistance', 'post_earnings_dip_rally', 'is_upward_trending', 
+        'trend_slope_15d', 'trend_slope_30d', 'broke_resistance', 'post_earnings_dip_rally', 'is_upward_trending', 
         'earnings_in_3_weeks', 'profit_margin', 'last_eps_surprise_pct', 'positive_surprise_last_q',
         'last_2q_positive_surprises', 'bullish_momentum', 'long_term_growth_rate', 'next_earnings_date',
         'macd', 'macd_signal', 'macd_histogram', 'bb_position', 'volume_ratio', 'pvt', 'obv',
-        'drawdown_30d', 'var_95_30d', 'sharpe_ratio', 'trend_strength', 'momentum_5d', 'momentum_10d', 'momentum_20d',
+        'drawdown_30d', 'var_95_30d', 'sharpe_ratio', 'trend_strength', 'momentum_5d', 'momentum_10d', 'momentum_20d', 'momentum_30d', 'momentum_60d', 'up_day_ratio_20d',
         'golden_cross', 'death_cross', 'distance_from_support', 'distance_from_resistance', 'breakout_strength',
-        'strong_momentum', 'risk_adjusted_momentum', 'breakout_confirmed'
+        'strong_momentum', 'risk_adjusted_momentum', 'breakout_confirmed', 'momentum_winner', 'trend_persistence_20d',
+        'atr_14d', 'atr_pct', 'volume_zscore_20', 'volume_spike', 'gap_pct', 'gap_up_2pct', 'gap_down_2pct', 'relative_strength_20d',
+        'vol_adj_momentum_20d', 'days_since_last_broke_resistance', 'return_1d', 'days_since_last_earnings', 'weighted_confidence_score'
     ]
     
     # Ensure all columns exist, fill missing with appropriate defaults

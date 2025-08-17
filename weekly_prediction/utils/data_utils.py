@@ -9,7 +9,7 @@ def load_stock_data(ticker, days=21):
     """
     try:
         # Load stock prices data
-        stock_prices_file = 'data/stock_prices_2024-06-01.csv'
+        stock_prices_file = os.getenv('STOCK_PRICES_CSV', 'data/stock_prices.csv')
         if os.path.exists(stock_prices_file):
             stock_data = pd.read_csv(stock_prices_file)
             
@@ -41,7 +41,7 @@ def load_featured_stocks_data():
     Load featured stocks data with all technical indicators.
     """
     try:
-        featured_file = 'data/featured_stocks.csv'
+        featured_file = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks.csv')
         if os.path.exists(featured_file):
             featured_data = pd.read_csv(featured_file)
             return featured_data
@@ -57,7 +57,7 @@ def load_earnings_history_data():
     Load earnings history data.
     """
     try:
-        earnings_file = 'data/earnings_history_2024-06-01.csv'
+        earnings_file = os.getenv('EARNINGS_HISTORY_CSV', 'data/earnings_history.csv')
         if os.path.exists(earnings_file):
             earnings_data = pd.read_csv(earnings_file)
             earnings_data['earnings_date'] = pd.to_datetime(earnings_data['earnings_date'])

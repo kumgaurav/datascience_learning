@@ -12,3 +12,5 @@ xgboost>=1.5.0
 langchain>=0.1.0
 langchain-openai>=0.1.0
 langchain-google-genai
+SQLAlchemy>=2.0.0
+PyMySQL>=1.1.0
