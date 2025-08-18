@@ -1,3 +1,19 @@
+"""Utility routines to prepare model-ready datasets.
+
+This module builds two families of artifacts from base OHLCV prices:
+
+- XGBoost tabular (per (ticker,date) snapshot):
+  Adds lag returns, rolling stats, RSI/MACD, Bollinger, volume trends,
+  market context (SPY 1–5d, 20d vol), excess return, 60d beta,
+  volatility regime flag, and momentum aliases.
+
+- LSTM sliding windows: 3D arrays of shape (num_windows, lookback, num_features)
+  with per-window z-score normalization and forward-return labels.
+
+All functions avoid forward-looking leakage by using only information up to each
+row's date. Where SPY context is missing, per-date cross-sectional medians are
+used as proxies to minimize NaNs.
+"""
 import argparse
 import os
 from typing import List, Tuple
@@ -7,6 +23,18 @@ import pandas as pd
 
 
 def _compute_technical_features(df: pd.DataFrame, price_col: str = "close") -> pd.DataFrame:
+    """Compute technical, volume, risk and market-context features.
+
+    Returns a copy of df with additional columns, preserving input rows. Newly
+    added columns include (non-exhaustive):
+      - return_{1,2,3,4,5,10,20}d, momentum_{5,10,20}d
+      - close_ma_{5,20}d, close_std_{5,20}d, volatility_{5,20}d
+      - rsi_14d, macd, macd_signal, bb_position
+      - volume_ma_20, volume_ratio
+      - spy_return_{1..5}d (with market medians as fallback), spy_vol_20d
+      - market_return_{1..5}d, market_vol_20d, excess_return_1d, beta_60d
+      - high_vol_regime (bool)
+    """
     df = df.sort_values(["ticker", "date"]).copy()
 
     # Lag returns (include 2d/4d to support SPY proxy fill)

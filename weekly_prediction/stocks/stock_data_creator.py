@@ -121,12 +121,12 @@ def transform_dataframe_for_table(table_name: str, df: pd.DataFrame) -> pd.DataF
                 f"stocksinfp is missing required columns: {', '.join(missing_columns)}"
             )
 
-        # Restrict to last 2 years of data relative to the latest available date in the dataset
+        # Restrict to a wider history window (last 2 years) to allow longer LSTM lookbacks
         # Ensure date is datetime
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         max_date = df["date"].max()
         if pd.notna(max_date):
-            cutoff_date = max_date - pd.DateOffset(years=1)
+            cutoff_date = max_date - pd.DateOffset(years=2)
             df = df[df["date"] >= cutoff_date]
         # Optional: sort by date for consistency
         df = df.sort_values(["ticker", "date"]) 
@@ -180,12 +180,14 @@ def transform_dataframe_for_table(table_name: str, df: pd.DataFrame) -> pd.DataF
                 df = df.drop(columns=["log_ret"], errors="ignore")
             print(f"[stocksinfp] Outlier filter skipped due to error: {exc}")
 
-        # Filter: keep only tickers that have the same number of rows as Apple (AAPL)
+        # Filter: relax equal-length requirement → keep tickers with "enough" rows
         try:
             aapl_rows = len(df[df["ticker"].astype(str).str.upper() == "AAPL"])
             if aapl_rows > 0:
                 counts = df["ticker"].value_counts()
-                keep_tickers = set(counts[counts == aapl_rows].index)
+                # Minimum required rows: max(65 rows ~ (lookback 60 + horizon 5), 80% of AAPL rows)
+                min_required = max(65, int(0.8 * aapl_rows))
+                keep_tickers = set(counts[counts >= min_required].index)
                 # Always keep SPY if present so market proxy features can be computed
                 if "SPY" in set(df["ticker"].astype(str).str.upper().unique()):
                     keep_tickers.add("SPY")
@@ -198,7 +200,7 @@ def transform_dataframe_for_table(table_name: str, df: pd.DataFrame) -> pd.DataF
                 removed_rows = before_rows - after_rows
                 if removed_tickers > 0:
                     print(
-                        f"[stocksinfp] Filtered tickers by AAPL row count ({aapl_rows}). "
+                        f"[stocksinfp] Relaxed length filter (min_required={min_required}, AAPL={aapl_rows}). "
                         f"Removed {removed_tickers} tickers and {removed_rows} rows; kept {after_tickers} tickers."
                     )
             else:
@@ -215,11 +217,22 @@ def transform_dataframe_for_table(table_name: str, df: pd.DataFrame) -> pd.DataF
 # -----------------------------
 
 class StockDataCreator:
-    """Exports database tables to CSV files under the project `data` folder.
+    """Exports database tables to CSV under `data/` with light, safe transforms.
 
-    Usage:
+    Responsibilities for `stocksinfp` (prices):
+      - normalize columns (date,ticker,open,high,low,close,volume)
+      - keep last 2 years of history
+      - drop illiquid/penny names (close ≥ $3, avg volume ≥ 300k)
+      - remove outlier rows via per-ticker log-return percentiles (1st–99th)
+      - relax equal-length requirement: keep tickers with at least max(65 rows, 80% of AAPL);
+        always keep SPY for market features.
+
+    Other tables are exported as-is. This class intentionally avoids any
+    forward-looking operations to preserve downstream model validity.
+
+    Example:
         creator = StockDataCreator()
-        creator.export_tables(["table_a", "table_b"], name_mapping={"table_b": "custom_name"})
+        creator.export_tables(["last_stock_earnings", "stocksinfp"], name_mapping={"last_stock_earnings": "stock_earnings", "stocksinfp": "stock_prices"})
     """
 
     def __init__(

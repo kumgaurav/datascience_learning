@@ -77,5 +77,11 @@
 
 👉 You’re using XGBoost correctly for engineered stock features.
 👉 The shift to **predicting % change** instead of raw price is the right move.
-👉 For production/trading, I’d suggest layering in **sequential models (LSTM/TFT)** later
+👉 For production/trading, I’d suggest layering in **sequential models (LSTM/TFT)** later'
+
+# 1) Re-export data with relaxed filters and 2y history
+python stocks/execute_data_creator.py
+
+# 2) Run the pipeline with ranking model + LSTM upgrades
+python run_pipeline_v2.py --prices data/stock_prices.csv --horizon 10 --lookback 30 --top_n 20
 

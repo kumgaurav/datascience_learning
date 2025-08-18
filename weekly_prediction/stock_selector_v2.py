@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Dict, Any
 # stock_selector_v2.py
 import pandas as pd
 import numpy as np
@@ -20,6 +20,10 @@ class StockSelector:
         self.horizon = horizon
         self.feature_cols = feature_cols
         self.lstm_lookback = lstm_lookback
+        try:
+            print(f"[SELECTOR INIT] model={type(model).__name__}, rows={len(self.df)}, cols={len(self.df.columns)}, horizon={horizon}")
+        except Exception:
+            pass
 
     def _prepare_latest(self):
         """Take the most recent feature row per ticker"""
@@ -54,7 +58,10 @@ class StockSelector:
 
         # Diagnostics: show columns present vs expected
         print(f"[SELECTOR DIAG] Latest shape: {latest.shape}")
-        print(f"[SELECTOR DIAG] Latest columns: {list(latest.columns)}")
+        try:
+            print(f"[SELECTOR DIAG] Latest columns sample: {list(latest.columns)[:8]} ...")
+        except Exception:
+            pass
 
         # Determine feature columns for inference
         if self.feature_cols is not None:
@@ -133,6 +140,12 @@ class StockSelector:
             1 + filtered["signal_pos_count"] + filtered["momentum_pos_count"]
         )
 
+        # Compute risk for UI and finalize ranking
+        try:
+            filtered.loc[:, "risk_score"] = filtered.apply(calculate_risk_score, axis=1)
+        except Exception:
+            filtered.loc[:, "risk_score"] = 50.0
+
         ranked = filtered.sort_values("confidence_score", ascending=False).head(top_n)
 
         # Optional SHAP explainability for XGB-like models
@@ -150,43 +163,87 @@ class StockSelector:
             except Exception:
                 pass
 
-        return ranked[["ticker", "pred_return_pct", "confidence_score"] + feature_cols]
+        # Minimal UI-ready columns plus signals and computed fields
+        extra_cols = [
+            "signal_pos_count", "momentum_pos_count", "risk_score"
+        ]
+        keep_cols = [c for c in extra_cols if c in ranked.columns]
+        return ranked[["ticker", "pred_return_pct", "confidence_score"] + keep_cols + feature_cols]
 
 
 # --- Compatibility helpers for UI (function-style API) ---
-def get_top_stocks(n: int = 20, min_confidence: int = 30, max_risk: int = 70, diversify: bool = True, verbose: bool = False, bullish_only: bool = True) -> pd.DataFrame:
+_MODEL_CACHE: Dict[str, Dict[str, Any]] = {}
+_DF_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_cached_model(path: str):
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = None
+    entry = _MODEL_CACHE.get(path)
+    if entry and entry.get("mtime") == mtime:
+        return entry["obj"]
+    obj = joblib.load(path)
+    _MODEL_CACHE[path] = {"mtime": mtime, "obj": obj}
+    return obj
+
+
+def _get_cached_csv(path: str) -> pd.DataFrame:
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = None
+    entry = _DF_CACHE.get(path)
+    if entry and entry.get("mtime") == mtime:
+        return entry["obj"].copy()
+    df = pd.read_csv(path)
+    _DF_CACHE[path] = {"mtime": mtime, "obj": df}
+    return df.copy()
+
+
+def get_top_stocks(
+    n: int = 20,
+    min_confidence: int = 30,
+    max_risk: int = 70,
+    diversify: bool = True,
+    verbose: bool = False,
+    bullish_only: bool = True,
+    model: Optional[Any] = None,
+    pred_df: Optional[pd.DataFrame] = None,
+    disp_df: Optional[pd.DataFrame] = None,
+    feature_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
     """
     Wrapper to produce top-N stocks using the enhanced selector.
     Reads model from models/stock_predictor_top.joblib and features from data/featured_stocks_top.csv.
     Adds predicted_change, risk_score, composite_score for UI compatibility.
     """
     model_path = os.path.join('models', 'stock_predictor_top.joblib')
-    # Use XGB inference features for prediction alignment; use featured CSV for display/extras
     pred_path = os.getenv('XGB_FEATURES_CSV', 'data/xgb_features_latest.csv')
     disp_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
+    # Load with caching only if not provided by caller
     try:
-        model = joblib.load(model_path)
-        # Prediction DataFrame (for model inference)
-        if os.path.exists(pred_path):
-            pred_df = pd.read_csv(pred_path)
-        else:
-            pred_df = pd.read_csv(disp_path)
-        # Display DataFrame (for UI fields like close/signals)
-        try:
-            disp_df = pd.read_csv(disp_path)
-        except Exception:
-            disp_df = pred_df.copy()
+        if model is None:
+            model = _get_cached_model(model_path)
+        if pred_df is None:
+            pred_df = _get_cached_csv(pred_path) if os.path.exists(pred_path) else _get_cached_csv(disp_path)
+        if disp_df is None:
+            try:
+                disp_df = _get_cached_csv(disp_path)
+            except Exception:
+                disp_df = pred_df.copy()
     except Exception as e:
         print(f"[SELECTOR_V2] Failed to load model or features: {e}")
         return pd.DataFrame()
 
     # Determine model feature columns
-    try:
-        feature_cols = model.get_booster().feature_names
-    except Exception:
-        # Fallback: infer numeric/bool excluding non-features
-        exclude = {"ticker", "date", "target", "open", "high", "low", "close", "volume"}
-        feature_cols = [c for c in pred_df.select_dtypes(include=['number', 'bool']).columns if c not in exclude]
+    if feature_cols is None:
+        try:
+            feature_cols = model.get_booster().feature_names
+        except Exception:
+            exclude = {"ticker", "date", "target", "open", "high", "low", "close", "volume"}
+            feature_cols = [c for c in pred_df.select_dtypes(include=['number', 'bool']).columns if c not in exclude]
 
     # Ensure all model feature columns exist; add missing as zeros for alignment
     missing = [c for c in feature_cols if c not in pred_df.columns]
@@ -252,7 +309,7 @@ def get_top_stocks(n: int = 20, min_confidence: int = 30, max_risk: int = 70, di
     return filtered.head(n)
 
 
-def get_stock_analysis(ticker: str):
+def get_stock_analysis(ticker: str) -> Optional[Dict[str, Any]]:
     """Compatibility helper to fetch per-ticker feature row for analysis panels."""
     feature_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
     try:
@@ -261,7 +318,7 @@ def get_stock_analysis(ticker: str):
         row = row[row['ticker'] == ticker]
         if row.empty:
             return None
-        return row.iloc[0]
+        return row.iloc[0].to_dict()
     except Exception as e:
         print(f"[SELECTOR_V2] get_stock_analysis failed for {ticker}: {e}")
         return None

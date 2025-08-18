@@ -10,6 +10,7 @@ from stock_selector_v2 import StockSelector
 from data_loader import load_all_data
 from feature_engineering import create_all_features
 from utils.data_prep import build_xgb_dataset, build_lstm_sequences, build_xgb_features
+from utils.tracking import get_tracker
 
 
 def main():
@@ -19,6 +20,10 @@ def main():
     parser.add_argument("--lookback", type=int, default=30, help="Sequence length for LSTM")
     parser.add_argument("--top_n", type=int, default=20, help="Number of top stocks to show")
     parser.add_argument("--save", default=None, help="Optional path to save ranked CSV")
+    parser.add_argument("--tracking", choices=["none", "mlflow", "wandb"], default=os.environ.get('TRACKING_MODE', 'none'), help="Experiment tracking backend")
+    parser.add_argument("--experiment", default=os.environ.get('EXPERIMENT_NAME', 'weekly_prediction'), help="Experiment name / project")
+    parser.add_argument("--mlflow-uri", default=os.environ.get('MLFLOW_TRACKING_URI'), help="MLflow tracking URI")
+    parser.add_argument("--wandb-entity", default=os.environ.get('WANDB_ENTITY'), help="W&B entity/org")
     args = parser.parse_args()
 
     # Load all data (master + prices), mirroring run_pipeline
@@ -34,7 +39,7 @@ def main():
     except Exception:
         today_date = None
     features_df = create_all_features(master_df, prices_df, today=today_date)
-    features_out_path = "data/featured_stocks_top_v2.csv"
+    features_out_path = "data/featured_stocks_top.csv"
     try:
         features_df.to_csv(features_out_path, index=False)
         print(f"[PIPE DIAG] Wrote features to: {features_out_path}")
@@ -70,8 +75,10 @@ def main():
         print(f"[PIPE DIAG] Failed to build/write LSTM sequences: {e}")
 
     # Train models from prepared datasets
+    tracker = get_tracker(mode=args.tracking, experiment_name=args.experiment, mlflow_uri=args.mlflow_uri, wandb_project=args.experiment, wandb_entity=args.wandb_entity)
+
     print("[PIPE] Training XGB model...")
-    xgb_model, xgb_preds = XGBTrainer(xgb_dataset_path).train()
+    xgb_model, xgb_preds = XGBTrainer(xgb_dataset_path, tracker=tracker, run_name='xgb_ranker').train()
     print("[PIPE] XGB training done.")
     # Persist XGB model where the UI expects it
     try:
@@ -81,7 +88,7 @@ def main():
     except Exception as e:
         print(f"[PIPE DIAG] Failed to save XGB model: {e}")
     print("[PIPE] Training LSTM model...")
-    lstm_model, lstm_preds = LSTMTrainer(xgb_dataset_path).train()
+    lstm_model, lstm_preds = LSTMTrainer(xgb_dataset_path, tracker=tracker, run_name='lstm').train()
     print("[PIPE] LSTM training done.")
 
     # Rank stocks using XGB model
@@ -219,6 +226,28 @@ def main():
         })
 
         # LSTM sequences for latest window per ticker
+        # If LSTM model is not built (no layers), skip LSTM in ensemble and fall back to XGB-only
+        if not hasattr(lstm_model, 'layers') or len(getattr(lstm_model, 'layers', [])) == 0:
+            print('[PIPE DIAG] LSTM model has no layers; using XGB-only ensemble output.')
+            try:
+                wx, wl = 1.0, 0.0
+                df_combined = df_xgb_latest.copy()
+                df_combined['ensemble_pred'] = df_combined['xgb_pred']
+                top_ens = df_combined.sort_values('ensemble_pred', ascending=False).head(args.top_n)
+                print('[PIPE DIAG] Top-N by Ensemble (XGB-only):')
+                print(top_ens[['ticker', 'ensemble_pred']].to_string(index=False))
+                ui_ens = latest_all.merge(df_combined[['ticker', 'ensemble_pred']], on='ticker', how='inner').copy()
+                ui_ens['predicted_return_pct'] = ui_ens['ensemble_pred']
+                ui_ens['w_xgb'] = float(wx)
+                ui_ens['w_lstm'] = float(wl)
+                os.makedirs('data', exist_ok=True)
+                ens_out_path = os.path.join('data', 'featured_stocks_top_ensemble.csv')
+                ui_ens[['ticker', 'date', 'close', 'predicted_return_pct', 'w_xgb', 'w_lstm']].to_csv(ens_out_path, index=False)
+                print(f"[PIPE DIAG] Wrote ensemble CSV to: {ens_out_path} (rows={len(ui_ens)})")
+            except Exception as e:
+                print(f"[PIPE DIAG] Failed to write XGB-only ensemble CSV: {e}")
+            # Skip the rest of LSTM ensemble block
+            return
         # Use the same feature set and lookback as the trained LSTM model to avoid shape mismatches
         try:
             lstm_feat_candidates = list(getattr(lstm_model, 'feature_cols'))
@@ -249,25 +278,45 @@ def main():
         df_ens_out = None
         if seq_list:
             X_lstm_latest = np.asarray(seq_list)
-            preds_lstm_latest = lstm_model.predict(X_lstm_latest).ravel()
+            try:
+                preds_lstm_latest = lstm_model.predict(X_lstm_latest).ravel()
+            except Exception as e:
+                print(f"[PIPE DIAG] LSTM prediction failed on latest sequences: {e}")
+                preds_lstm_latest = None
             df_lstm_latest = pd.DataFrame({
                 'ticker': tickers_seq,
-                'lstm_pred': preds_lstm_latest
+                'lstm_pred': preds_lstm_latest if preds_lstm_latest is not None else np.nan
             })
 
             # Align on intersection of tickers and filter non-finite preds
             df_combined = df_xgb_latest.merge(df_lstm_latest, on='ticker', how='inner')
-            df_combined = df_combined[np.isfinite(df_combined['xgb_pred']) & np.isfinite(df_combined['lstm_pred'])]
+            # Keep rows where at least one model produced a finite prediction
+            mask_x = np.isfinite(df_combined['xgb_pred'])
+            mask_l = np.isfinite(df_combined['lstm_pred'])
+            df_combined = df_combined[mask_x | mask_l]
             if not df_combined.empty:
                 # Weight by validation MAE if available (lower MAE -> higher weight)
                 xgb_mae = getattr(xgb_model, '_validation_mae', None)
                 lstm_mae = getattr(lstm_model, '_validation_mae', None)
-                if isinstance(xgb_mae, (int, float)) and isinstance(lstm_mae, (int, float)) and np.isfinite(xgb_mae) and np.isfinite(lstm_mae) and (xgb_mae + lstm_mae) > 0:
+                # Defaults
+                wx = wl = 0.5
+                if isinstance(xgb_mae, (int, float)) and np.isfinite(xgb_mae) and xgb_mae > 0 and \
+                   isinstance(lstm_mae, (int, float)) and np.isfinite(lstm_mae) and lstm_mae > 0:
                     wx = lstm_mae / (xgb_mae + lstm_mae)
                     wl = xgb_mae / (xgb_mae + lstm_mae)
-                else:
-                    wx = wl = 0.5
-                df_combined['ensemble_pred'] = wx * df_combined['xgb_pred'] + wl * df_combined['lstm_pred']
+                # If one model has no predictions or invalid weights, fallback to the other
+                only_xgb = mask_x & ~mask_l
+                only_lstm = mask_l & ~mask_x
+                both = mask_x & mask_l
+                ens_vals = np.zeros(len(df_combined), dtype=float)
+                ens_vals[only_xgb.values] = df_combined.loc[only_xgb, 'xgb_pred'].values
+                ens_vals[only_lstm.values] = df_combined.loc[only_lstm, 'lstm_pred'].values
+                if both.any():
+                    ens_vals[both.values] = (
+                        wx * df_combined.loc[both, 'xgb_pred'].values +
+                        wl * df_combined.loc[both, 'lstm_pred'].values
+                    )
+                df_combined['ensemble_pred'] = ens_vals
                 # Print diagnostic Top-N
                 top_ens = df_combined.sort_values('ensemble_pred', ascending=False).head(args.top_n)
                 print("[PIPE DIAG] Top-N by Ensemble (XGB+LSTM):")
