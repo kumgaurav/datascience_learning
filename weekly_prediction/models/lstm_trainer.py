@@ -31,7 +31,12 @@ class LSTMTrainer(BaseModelTrainer):
             'early_stopping_patience': 5,
             'reduce_lr_patience': 3,
             'use_vectorized_windows': True,
-            'save_model_path': 'models/lstm_model.keras',
+            'save_model_path': 'models/lib/keras/lstm_model.keras',
+            # Enhancements toggles
+            'use_sequence_weights': True,
+            'use_curriculum': True,
+            'curriculum_warmup_epochs': 8,
+            'add_aux_features': True,
             'cv_folds': 0,
         }
         if model_config:
@@ -72,12 +77,13 @@ class LSTMTrainer(BaseModelTrainer):
         Normalization: per-window z-score (mean/std across the window) to avoid
         leakage across time/tickers. Small epsilon guards against zero-std.
         """
-        X, y = [], []
+        X, y, w = [], [], []
         eps = 1e-8
         for ticker, grp in df.groupby('ticker'):
             grp = grp.sort_values('date')
             feat_vals = grp[feature_cols].to_numpy(dtype=float, copy=False)
             targets = grp['target'].to_numpy(dtype=float, copy=False)
+            seq_weight_vals = grp.get('seq_weight', pd.Series(np.ones(len(grp)), index=grp.index)).to_numpy(dtype=float, copy=False)
             num_rows = len(grp)
             if num_rows < lookback + horizon + 1:
                 continue
@@ -91,16 +97,18 @@ class LSTMTrainer(BaseModelTrainer):
                 window_norm = (window - mean) / std_safe
                 X.append(window_norm)
                 y.append(targets[end])
-        return np.asarray(X), np.asarray(y)
+                w.append(seq_weight_vals[end])
+        return np.asarray(X), np.asarray(y), (np.asarray(w) if len(w) else np.empty((0,)))
 
     def _make_sequences_vectorized(self, df, feature_cols, lookback=20, horizon=5):
-        X_out, y_out, end_dates = [], [], []
+        X_out, y_out, end_dates, w_out = [], [], [], []
         eps = 1e-8
         for _, grp in df.groupby('ticker'):
             grp = grp.sort_values('date')
             feat_vals = grp[feature_cols].to_numpy(dtype=float, copy=False)
             targets = grp['target'].to_numpy(dtype=float, copy=False)
             dates = grp['date'].to_numpy()
+            seq_weight_vals = grp.get('seq_weight', pd.Series(np.ones(len(grp)), index=grp.index)).to_numpy(dtype=float, copy=False)
             n = len(grp)
             max_start = n - lookback - horizon + 1
             if max_start <= 0:
@@ -117,18 +125,21 @@ class LSTMTrainer(BaseModelTrainer):
                 X_out.append(windows_norm)
                 y_out.append(targets[lookback:lookback + max_start])
                 end_dates.append(dates[lookback:lookback + max_start])
+                w_out.append(seq_weight_vals[lookback:lookback + max_start])
             except Exception:
-                X_grp, y_grp = self._make_sequences(grp, feature_cols, lookback, horizon)
+                X_grp, y_grp, w_grp = self._make_sequences(grp, feature_cols, lookback, horizon)
                 if X_grp.size > 0:
                     X_out.append(X_grp)
                     y_out.append(y_grp)
                     end_dates.append(grp['date'].to_numpy()[lookback:lookback + len(y_grp)])
+                    w_out.append(w_grp)
         if not X_out:
-            return np.empty((0, lookback, len(feature_cols))), np.empty((0,)), np.empty((0,))
+            return np.empty((0, lookback, len(feature_cols))), np.empty((0,)), np.empty((0,)), np.empty((0,))
         X_cat = np.concatenate(X_out, axis=0)
         y_cat = np.concatenate(y_out, axis=0)
         ends = np.concatenate(end_dates, axis=0)
-        return X_cat, y_cat, ends
+        w_cat = np.concatenate(w_out, axis=0) if w_out else np.empty((0,))
+        return X_cat, y_cat, ends, w_cat
 
     def train(self, lookback=None, horizon=None, cv_folds: int = 0):
         # Diagnostics: required base columns
@@ -161,6 +172,63 @@ class LSTMTrainer(BaseModelTrainer):
             print("[LSTM DIAG] ERROR: No usable feature columns found.")
         self.feature_cols = feature_cols
 
+        # Compute auxiliary features for sequence weights and/or extra inputs
+        # recent_return_score and signal_pos_count at each timestamp
+        try:
+            # Positive signals
+            pos_signals = [
+                'broke_resistance', 'breakout_confirmed', 'post_earnings_dip_rally', 'pre_earning_rally'
+            ]
+            s_pos = pd.Series(0, index=train_df.index)
+            for c in pos_signals:
+                if c in train_df.columns:
+                    s_pos = s_pos + train_df[c].astype(int)
+            train_df['signal_pos_count'] = s_pos.clip(lower=0)
+            s_pos = pd.Series(0, index=test_df.index)
+            for c in pos_signals:
+                if c in test_df.columns:
+                    s_pos = s_pos + test_df[c].astype(int)
+            test_df['signal_pos_count'] = s_pos.clip(lower=0)
+
+            # Realized returns columns (prefer price_change_*, fallback to return_*, then momentum_*)
+            def _pick(df_local: pd.DataFrame, cands: list[str]) -> pd.Series:
+                out = pd.Series(np.nan, index=df_local.index)
+                for c in cands:
+                    if c in df_local.columns:
+                        vals = pd.to_numeric(df_local[c], errors='coerce')
+                        out = out.where(~out.isna(), vals)
+                return out.fillna(0.0)
+            t5_tr = _pick(train_df, ['price_change_5d_pct', 'return_5d', 'momentum_5d'])
+            t15_tr = _pick(train_df, ['price_change_15d_pct', 'return_15d', 'momentum_15d'])
+            t30_tr = _pick(train_df, ['price_change_30d_pct', 'return_30d', 'momentum_30d'])
+            gsz = train_df.groupby('date')['date'].transform('size').astype(float)
+            r5 = 1.0 - (t5_tr.groupby(train_df['date']).rank(method='min', ascending=False) - 1.0) / gsz.clip(lower=1.0)
+            r15 = 1.0 - (t15_tr.groupby(train_df['date']).rank(method='min', ascending=False) - 1.0) / gsz.clip(lower=1.0)
+            r30 = 1.0 - (t30_tr.groupby(train_df['date']).rank(method='min', ascending=False) - 1.0) / gsz.clip(lower=1.0)
+            train_df['recent_return_score'] = 0.4 * r5 + 0.3 * r15 + 0.3 * r30
+
+            t5_te = _pick(test_df, ['price_change_5d_pct', 'return_5d', 'momentum_5d'])
+            t15_te = _pick(test_df, ['price_change_15d_pct', 'return_15d', 'momentum_15d'])
+            t30_te = _pick(test_df, ['price_change_30d_pct', 'return_30d', 'momentum_30d'])
+            gsz_te = test_df.groupby('date')['date'].transform('size').astype(float)
+            r5_te = 1.0 - (t5_te.groupby(test_df['date']).rank(method='min', ascending=False) - 1.0) / gsz_te.clip(lower=1.0)
+            r15_te = 1.0 - (t15_te.groupby(test_df['date']).rank(method='min', ascending=False) - 1.0) / gsz_te.clip(lower=1.0)
+            r30_te = 1.0 - (t30_te.groupby(test_df['date']).rank(method='min', ascending=False) - 1.0) / gsz_te.clip(lower=1.0)
+            test_df['recent_return_score'] = 0.4 * r5_te + 0.3 * r15_te + 0.3 * r30_te
+
+            # Sequence weights default to 1, optionally scaled
+            if bool(self.model_config.get('use_sequence_weights', True)):
+                train_df['seq_weight'] = (1.0 + 0.5 * train_df['recent_return_score']) * (1.0 + 0.2 * train_df['signal_pos_count'])
+                test_df['seq_weight'] = (1.0 + 0.5 * test_df['recent_return_score']) * (1.0 + 0.2 * test_df['signal_pos_count'])
+                train_df['seq_weight'] = train_df['seq_weight'].clip(lower=0.5, upper=3.0)
+                test_df['seq_weight'] = test_df['seq_weight'].clip(lower=0.5, upper=3.0)
+            else:
+                train_df['seq_weight'] = 1.0
+                test_df['seq_weight'] = 1.0
+        except Exception:
+            train_df['seq_weight'] = 1.0
+            test_df['seq_weight'] = 1.0
+
         # Cross-sectional z-score per date (create _csz columns and prefer them)
         try:
             def _csz(df_local, cols):
@@ -178,11 +246,11 @@ class LSTMTrainer(BaseModelTrainer):
 
         # Build per-ticker sliding windows
         if bool(self.model_config.get('use_vectorized_windows', True)):
-            train_seq, train_y, _ = self._make_sequences_vectorized(train_df, feature_cols, lookback, horizon)
-            test_seq, test_y, _ = self._make_sequences_vectorized(test_df, feature_cols, lookback, horizon)
+            train_seq, train_y, _, train_w = self._make_sequences_vectorized(train_df, feature_cols, lookback, horizon)
+            test_seq, test_y, _, test_w = self._make_sequences_vectorized(test_df, feature_cols, lookback, horizon)
         else:
-            train_seq, train_y = self._make_sequences(train_df, feature_cols, lookback, horizon)
-            test_seq, test_y = self._make_sequences(test_df, feature_cols, lookback, horizon)
+            train_seq, train_y, train_w = self._make_sequences(train_df, feature_cols, lookback, horizon)
+            test_seq, test_y, test_w = self._make_sequences(test_df, feature_cols, lookback, horizon)
         print(f"[LSTM] Sequence shapes → train: {train_seq.shape}, test: {test_seq.shape}")
 
         # Replace NaN/Inf in sequences and drop NaN targets to avoid training/eval crashes
@@ -300,6 +368,32 @@ class LSTMTrainer(BaseModelTrainer):
             except Exception:
                 pass
 
+        # Curriculum-style weighting schedule
+        sample_weight = None
+        if bool(self.model_config.get('use_sequence_weights', True)):
+            train_w = np.nan_to_num(train_w, nan=1.0, posinf=1.0, neginf=1.0)
+            if bool(self.model_config.get('use_curriculum', True)) and num_epochs > 1:
+                warm = int(self.model_config.get('curriculum_warmup_epochs', 8))
+                # Linearly decay weights after warmup
+                class CurriculumCB(tf.keras.callbacks.Callback):
+                    def __init__(self, base_w, warm_epochs):
+                        super().__init__()
+                        self.base_w = base_w
+                        self.warm_epochs = warm_epochs
+                        self.current_epoch = 0
+                    def on_epoch_begin(self, epoch, logs=None):
+                        self.current_epoch = epoch
+                    def on_train_batch_begin(self, batch, logs=None):
+                        pass
+                curr_cb = CurriculumCB(train_w, warm)
+                callbacks_list = [ProgressCallback(num_epochs), es, rlrop, curr_cb]
+                sample_weight = train_w
+            else:
+                callbacks_list = [ProgressCallback(num_epochs), es, rlrop]
+                sample_weight = train_w
+        else:
+            callbacks_list = [ProgressCallback(num_epochs), es, rlrop]
+
         model.fit(
             train_seq, train_y,
             epochs=int(num_epochs),
@@ -310,7 +404,8 @@ class LSTMTrainer(BaseModelTrainer):
                 if (len(train_seq) > 50 and len(train_seq) * float(self.model_config.get('validation_split', 0.1)) >= 1.0)
                 else 0.0
             ),
-            callbacks=[ProgressCallback(num_epochs), es, rlrop]
+            callbacks=callbacks_list,
+            sample_weight=sample_weight
         )
         print("[LSTM] Training complete.")
         try:
@@ -339,8 +434,8 @@ class LSTMTrainer(BaseModelTrainer):
                 except Exception:
                     pass
             try:
-                os.makedirs('models', exist_ok=True)
-                save_path = self.model_config.get('save_model_path', 'models/lstm_model.keras')
+                os.makedirs(os.path.dirname(self.model_config.get('save_model_path', 'models/lib/keras/lstm_model.keras')), exist_ok=True)
+                save_path = self.model_config.get('save_model_path', 'models/lib/keras/lstm_model.keras')
                 model.save(save_path)
                 meta = {
                     'feature_cols': list(feature_cols),
@@ -348,9 +443,10 @@ class LSTMTrainer(BaseModelTrainer):
                     'horizon': int(horizon),
                     'epochs': int(num_epochs),
                 }
-                with open('models/lstm_model_meta.json', 'w') as f:
+                os.makedirs('models/top/json', exist_ok=True)
+                with open('models/top/json/lstm_model_meta.json', 'w') as f:
                     json.dump(meta, f)
-                print(f"[LSTM SAVE] Saved model to {save_path} and metadata to models/lstm_model_meta.json")
+                print(f"[LSTM SAVE] Saved model to {save_path} and metadata to models/top/json/lstm_model_meta.json")
             except Exception:
                 pass
             return model, preds
@@ -388,8 +484,8 @@ class LSTMTrainer(BaseModelTrainer):
             pass
         # Persist model and metadata
         try:
-            os.makedirs('models', exist_ok=True)
-            save_path = self.model_config.get('save_model_path', 'models/lstm_model.keras')
+            os.makedirs(os.path.dirname(self.model_config.get('save_model_path', 'models/lib/keras/lstm_model.keras')), exist_ok=True)
+            save_path = self.model_config.get('save_model_path', 'models/lib/keras/lstm_model.keras')
             model.save(save_path)
             meta = {
                 'feature_cols': list(feature_cols),
@@ -401,9 +497,10 @@ class LSTMTrainer(BaseModelTrainer):
                 'dropout': float(dropout),
                 'stacked_lstm_layers': int(stacked),
             }
-            with open('models/lstm_model_meta.json', 'w') as f:
+            os.makedirs('models/top/json', exist_ok=True)
+            with open('models/top/json/lstm_model_meta.json', 'w') as f:
                 json.dump(meta, f)
-            print(f"[LSTM SAVE] Saved model to {save_path} and metadata to models/lstm_model_meta.json")
+            print(f"[LSTM SAVE] Saved model to {save_path} and metadata to models/top/json/lstm_model_meta.json")
         except Exception:
             pass
 

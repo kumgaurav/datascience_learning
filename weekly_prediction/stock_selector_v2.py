@@ -97,16 +97,8 @@ class StockSelector:
             preds = self._predict_tabular(latest, feature_cols)
             latest["pred_return_pct"] = preds
 
-        # Apply bullish confidence filter
-        bullish_filter = (
-            (latest.get("broke_resistance", False).astype(bool)) |
-            (latest.get("post_earnings_dip_rally", False).astype(bool))
-        )
-        filtered = latest[bullish_filter].copy()
-
-        if filtered.empty:
-            print("⚠️ No stocks passed bullish filter, falling back to top N by prediction.")
-            filtered = latest
+        # Include all stocks for ranking (filter only at UI later)
+        filtered = latest.copy()
 
         # Compute signal count and confidence score for ranking
         pos_signals = [
@@ -135,9 +127,69 @@ class StockSelector:
         filtered.loc[:, "momentum_pos_count"] = (
             (m5 > 0).astype(int) + (m10 > 0).astype(int) + (m20 > 0).astype(int)
         )
-        # Combine into confidence: predicted return scaled by total positive signals
-        filtered.loc[:, "confidence_score"] = filtered["pred_return_pct"] * (
-            1 + filtered["signal_pos_count"] + filtered["momentum_pos_count"]
+        # Build realized momentum rank scores across the full universe and persist to data/top
+        latest = latest.copy()
+        latest.loc[:, 'ticker'] = latest['ticker'].astype(str).str.upper()
+        filtered.loc[:, 'ticker'] = filtered['ticker'].astype(str).str.upper()
+
+        def _pick_first_present_col(df: pd.DataFrame, candidates: List[str]) -> pd.Series:
+            vals = pd.Series([None] * len(df), index=df.index, dtype='float64')
+            for c in candidates:
+                if c in df.columns:
+                    s = pd.to_numeric(df[c], errors='coerce')
+                    vals = vals.where(~vals.isna(), s)
+            vals = vals.fillna(0.0)
+            return vals
+
+        # Candidate columns for realized returns
+        s5_raw = _pick_first_present_col(latest, [
+            'price_change_5d_pct', 'return_5d', 'momentum_5d'
+        ])
+        s15_raw = _pick_first_present_col(latest, [
+            'price_change_15d_pct', 'return_15d', 'momentum_15d'
+        ])
+        s30_raw = _pick_first_present_col(latest, [
+            'price_change_30d_pct', 'return_30d', 'momentum_30d'
+        ])
+
+        N = max(len(latest), 1)
+        rank_5 = s5_raw.rank(method='min', ascending=False)
+        rank_15 = s15_raw.rank(method='min', ascending=False)
+        rank_30 = s30_raw.rank(method='min', ascending=False)
+        score_5 = 1.0 - (rank_5 - 1.0) / float(N)
+        score_15 = 1.0 - (rank_15 - 1.0) / float(N)
+        score_30 = 1.0 - (rank_30 - 1.0) / float(N)
+
+        recent_return_score_series = 0.4 * score_5 + 0.3 * score_15 + 0.3 * score_30
+
+        # Persist scores for transparency and reuse
+        try:
+            out_dir = os.path.join('data', 'top')
+            os.makedirs(out_dir, exist_ok=True)
+            out_df = pd.DataFrame({
+                'ticker': latest['ticker'],
+                'rank_score_5d': score_5.astype(float).round(6),
+                'rank_score_15d': score_15.astype(float).round(6),
+                'rank_score_30d': score_30.astype(float).round(6),
+                'recent_return_score': recent_return_score_series.astype(float).round(6),
+                'value_5d': s5_raw.astype(float).round(6),
+                'value_15d': s15_raw.astype(float).round(6),
+                'value_30d': s30_raw.astype(float).round(6),
+            })
+            out_df = out_df.drop_duplicates('ticker')
+            out_df.to_csv(os.path.join(out_dir, 'realized_rank_scores.csv'), index=False)
+        except Exception:
+            pass
+
+        # Attach to filtered for scoring
+        scores_map = dict(zip(latest['ticker'], recent_return_score_series))
+        filtered.loc[:, 'recent_return_score'] = filtered['ticker'].map(lambda t: scores_map.get(t, 0.0))
+
+        # Confidence score
+        filtered.loc[:, "confidence_score"] = (
+            filtered["pred_return_pct"]
+            * (1 + 0.5 * filtered["signal_pos_count"] + 0.5 * filtered["momentum_pos_count"])
+            * (1 + filtered['recent_return_score'])
         )
 
         # Compute risk for UI and finalize ranking
@@ -146,7 +198,9 @@ class StockSelector:
         except Exception:
             filtered.loc[:, "risk_score"] = 50.0
 
-        ranked = filtered.sort_values("confidence_score", ascending=False).head(top_n)
+        ranked = filtered.sort_values("confidence_score", ascending=False)
+        if top_n is not None:
+            ranked = ranked.head(top_n)
 
         # Optional SHAP explainability for XGB-like models
         if explain:
@@ -168,7 +222,18 @@ class StockSelector:
             "signal_pos_count", "momentum_pos_count", "risk_score"
         ]
         keep_cols = [c for c in extra_cols if c in ranked.columns]
-        return ranked[["ticker", "pred_return_pct", "confidence_score"] + keep_cols + feature_cols]
+        base_cols = ["ticker", "pred_return_pct", "confidence_score"] + keep_cols
+        # Avoid duplicate columns when model feature list already contains computed fields
+        feature_cols_extra = [c for c in feature_cols if c not in base_cols]
+        final_cols = base_cols + feature_cols_extra
+        # Safety: enforce uniqueness order-preserving
+        seen = set()
+        final_cols_unique = []
+        for c in final_cols:
+            if c not in seen:
+                final_cols_unique.append(c)
+                seen.add(c)
+        return ranked[final_cols_unique]
 
 
 # --- Compatibility helpers for UI (function-style API) ---
@@ -203,7 +268,7 @@ def _get_cached_csv(path: str) -> pd.DataFrame:
 
 
 def get_top_stocks(
-    n: int = 20,
+    n: int = 25,
     min_confidence: int = 30,
     max_risk: int = 70,
     diversify: bool = True,
@@ -220,7 +285,7 @@ def get_top_stocks(
     Adds predicted_change, risk_score, composite_score for UI compatibility.
     """
     model_path = os.path.join('models', 'stock_predictor_top.joblib')
-    pred_path = os.getenv('XGB_FEATURES_CSV', 'data/xgb_features_latest.csv')
+    pred_path = os.getenv('XGB_FEATURES_CSV', 'data/top/xgb_features_latest.csv')
     disp_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
     # Load with caching only if not provided by caller
     try:
@@ -256,7 +321,7 @@ def get_top_stocks(
     if ranked.empty:
         return ranked
 
-    # Ensure consistent naming
+    # Ensure consistent naming (note: for ranker this is a score, not true pct)
     ranked = ranked.rename(columns={"pred_return_pct": "predicted_return_pct"})
 
     # Merge UI/display fields from featured CSV (latest per ticker)
@@ -294,6 +359,113 @@ def get_top_stocks(
         ranked['confidence_score'] * 0.3 +
         (100 - ranked['risk_score']) * 0.2
     )
+    # Persist XGB-ranked output for two-step workflow
+    try:
+        out_dir = os.path.join('data', 'top')
+        os.makedirs(out_dir, exist_ok=True)
+        ranked[['ticker', 'predicted_return_pct', 'confidence_score', 'risk_score', 'composite_score']].to_csv(
+            os.path.join(out_dir, 'xgb_ranked.csv'), index=False
+        )
+    except Exception:
+        pass
+
+    # --- Optional LSTM ensemble for weekly return regression ---
+    # Enable only if explicitly requested to support a clean two-step pipeline
+    if os.getenv('ENABLE_LSTM_ENSEMBLE', '').lower() != 'true':
+        return ranked
+    # Try to load an LSTM Keras model and its meta; if available, predict next-week returns
+    try:
+        import json as _json  # local import to avoid global dep
+        import numpy as _np
+        from tensorflow import keras as _keras  # type: ignore
+
+        # New locations per request
+        lstm_model_path = os.path.join('models', 'lib', 'keras', 'lstm_model.keras')
+        lstm_meta_path = os.path.join('models', 'top', 'json', 'lstm_model_meta.json')
+        lstm_model = None
+        feature_cols_lstm = None
+        lookback_lstm = None
+        if os.path.exists(lstm_model_path) and os.path.exists(lstm_meta_path):
+            try:
+                with open(lstm_meta_path, 'r') as f:
+                    meta = _json.load(f)
+                feature_cols_lstm = meta.get('feature_cols')
+                lookback_lstm = int(meta.get('lookback', 30))
+                lstm_model = _keras.models.load_model(lstm_model_path)
+            except Exception:
+                lstm_model = None
+        if lstm_model is not None and feature_cols_lstm:
+            # Build per-ticker sequences for the ranked tickers using pred_df
+            preds_map = {}
+            # Prefer a historical features CSV for sequence building if provided
+            hist_path = os.getenv('ENSEMBLE_LSTM_FEATURES_CSV', '').strip()
+            seq_df = pred_df
+            try:
+                if hist_path and os.path.exists(hist_path):
+                    seq_df = pd.read_csv(hist_path)
+            except Exception:
+                seq_df = pred_df
+            for tkr in ranked['ticker'].astype(str).str.upper().tolist():
+                g = seq_df[seq_df['ticker'].astype(str).str.upper() == tkr].copy()
+                if g.empty:
+                    continue
+                g = g.sort_values('date')
+                # Ensure required LSTM feature columns exist
+                use_cols = []
+                for c in feature_cols_lstm:
+                    if c not in g.columns:
+                        g[c] = 0.0
+                    use_cols.append(c)
+                if len(g) < int(lookback_lstm or 30):
+                    continue
+                window = g[use_cols].tail(int(lookback_lstm or 30)).to_numpy(dtype=float)
+                X_seq = window.reshape((1, window.shape[0], window.shape[1]))
+                try:
+                    y_pred = float(lstm_model.predict(X_seq, verbose=0).ravel()[0])
+                    preds_map[tkr] = y_pred
+                except Exception:
+                    continue
+            # Attach predictions
+            if preds_map:
+                ranked['lstm_predicted_return_pct'] = ranked['ticker'].astype(str).str.upper().map(lambda t: preds_map.get(t, _np.nan))
+                # Persist to data/top
+                try:
+                    out_dir = os.path.join('data', 'top')
+                    os.makedirs(out_dir, exist_ok=True)
+                    pd.DataFrame({
+                        'ticker': list(preds_map.keys()),
+                        'lstm_predicted_return_pct': list(preds_map.values()),
+                    }).to_csv(os.path.join(out_dir, 'lstm_weekly_predictions.csv'), index=False)
+                except Exception:
+                    pass
+                # Normalize scores and build ensemble
+                def _minmax(s: pd.Series) -> pd.Series:
+                    try:
+                        s = pd.to_numeric(s, errors='coerce')
+                        mn, mx = s.min(), s.max()
+                        if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+                            return pd.Series(0.5, index=s.index)
+                        return (s - mn) / (mx - mn)
+                    except Exception:
+                        return pd.Series(0.5, index=s.index)
+                ranker_norm = _minmax(ranked.get('confidence_score', pd.Series(0.0, index=ranked.index)))
+                lstm_norm = _minmax(ranked.get('lstm_predicted_return_pct', pd.Series(0.0, index=ranked.index)))
+                alpha = float(os.getenv('ENSEMBLE_ALPHA', '0.6'))  # weight on ranker
+                ranked['ensemble_score'] = alpha * ranker_norm + (1 - alpha) * lstm_norm
+                # Save ensemble scores
+                try:
+                    out_dir = os.path.join('data', 'top')
+                    os.makedirs(out_dir, exist_ok=True)
+                    ranked[['ticker', 'confidence_score', 'lstm_predicted_return_pct', 'ensemble_score']].to_csv(
+                        os.path.join(out_dir, 'final_ensemble_scores.csv'), index=False
+                    )
+                except Exception:
+                    pass
+                # Re-rank by ensemble
+                ranked = ranked.sort_values('ensemble_score', ascending=False)
+    except Exception:
+        # If TF not installed or model missing, silently skip ensemble
+        pass
 
     # Apply UI thresholds; keep ability to backfill to N
     filt = (

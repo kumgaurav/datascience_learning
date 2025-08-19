@@ -204,7 +204,8 @@ st.sidebar.header("📊 Filter Settings")
 min_confidence = st.sidebar.slider("Minimum Confidence Score", 0, 100, 30, help="Higher = more confident predictions")
 max_risk = st.sidebar.slider("Maximum Risk Score", 0, 100, 70, help="Lower = less risky stocks")
 diversify = st.sidebar.checkbox("Apply Portfolio Diversification", True, help="Limit exposure per sector/industry")
-num_stocks = st.sidebar.selectbox("Number of Stocks", [10, 15, 20, 25, 30], index=2)
+# Default to 25 stocks
+num_stocks = st.sidebar.selectbox("Number of Stocks", [10, 15, 20, 25, 30], index=3)
 
 # API Key Status
 st.sidebar.header("🔑 API Configuration")
@@ -348,9 +349,65 @@ if not st.session_state.top_stocks_df.empty:
         if selected_ticker:
             # Load complete featured data to get all technical indicators
             try:
-                featured_stocks_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
-                complete_featured_data = pd.read_csv(featured_stocks_path)
+                # Prefer merged weekly features+ranked output for richest technicals
+                weekly_path = 'data/top/xgb_weekly_output.csv'
+                if os.path.exists(weekly_path):
+                    complete_featured_data = pd.read_csv(weekly_path)
+                else:
+                    # Env may point to legacy path; add robust fallbacks
+                    env_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
+                    try_paths = [env_path, 'data/top/featured_stocks_top.csv', 'data/featured_stocks_top.csv']
+                    picked = None
+                    for _p in try_paths:
+                        if os.path.exists(_p):
+                            picked = _p
+                            break
+                    if picked is None:
+                        raise FileNotFoundError(f"No featured stocks CSV found in {try_paths}")
+                    complete_featured_data = pd.read_csv(picked)
+                if 'ticker' in complete_featured_data.columns:
+                    complete_featured_data['ticker'] = complete_featured_data['ticker'].astype(str).str.upper()
                 stock_featured_data = complete_featured_data[complete_featured_data['ticker'] == selected_ticker].iloc[0]
+                # Backfill support/resistance if missing from weekly output
+                try:
+                    need_sr = []
+                    for _c in ['support_20d', 'resistance_20d']:
+                        if _c not in stock_featured_data.index or pd.isna(stock_featured_data.get(_c)):
+                            need_sr.append(_c)
+                    if need_sr:
+                        # Try from featured_stocks_top.csv
+                        try:
+                            _feat_top_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
+                            _feat_top = pd.read_csv(_feat_top_path)
+                            if 'ticker' in _feat_top.columns:
+                                _feat_top['ticker'] = _feat_top['ticker'].astype(str).str.upper()
+                                _row = _feat_top[_feat_top['ticker'] == selected_ticker]
+                                if not _row.empty:
+                                    _row = _row.iloc[0]
+                                    for _c in need_sr:
+                                        if _c in _row.index and not pd.isna(_row.get(_c)):
+                                            stock_featured_data[_c] = _row.get(_c)
+                        except Exception:
+                            pass
+                        # If still missing, compute from last 20 closes
+                        still_missing = [
+                            _c for _c in ['support_20d', 'resistance_20d']
+                            if _c not in stock_featured_data.index or pd.isna(stock_featured_data.get(_c))
+                        ]
+                        if still_missing:
+                            try:
+                                _td = stock_data[stock_data['ticker'] == selected_ticker].copy()
+                                _td['date'] = pd.to_datetime(_td['date'], errors='coerce')
+                                _td = _td.sort_values('date').tail(20)
+                                if len(_td) > 0:
+                                    if 'support_20d' in still_missing:
+                                        stock_featured_data['support_20d'] = float(_td['close'].min())
+                                    if 'resistance_20d' in still_missing:
+                                        stock_featured_data['resistance_20d'] = float(_td['close'].max())
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 
                 # Get predicted return and confidence data from filtered stocks if available
                 if not st.session_state.top_stocks_df.empty:
@@ -1262,9 +1319,15 @@ if not st.session_state.top_stocks_df.empty:
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Stock Rankings", "🎯 Risk vs Return", "📈 Technical Signals", "🏢 Sector Analysis"])
     
     with tab1:
-        # Stock rankings chart
+        # Stock rankings chart (exclude low-priced stocks < $3)
+        _chart_df = st.session_state.top_stocks_df.copy()
+        if 'close' in _chart_df.columns:
+            try:
+                _chart_df = _chart_df[pd.to_numeric(_chart_df['close'], errors='coerce') >= 3]
+            except Exception:
+                pass
         fig = px.bar(
-            st.session_state.top_stocks_df.head(10),
+            _chart_df.head(num_stocks),
             x='ticker',
             y='predicted_return_pct',
             color='confidence_score',
@@ -1272,6 +1335,7 @@ if not st.session_state.top_stocks_df.empty:
             labels={'predicted_return_pct': 'Predicted Return (%)', 'confidence_score': 'Confidence Score'},
             color_continuous_scale='RdYlGn'
         )
+        fig.update_layout(title=f"Top {num_stocks} Stocks by Predicted Return")
         fig.update_layout(height=500)
         st.plotly_chart(fig, use_container_width=True)
     
@@ -1364,19 +1428,119 @@ if not st.session_state.top_stocks_df.empty:
     
     # Format the dataframe for better readability
     df_to_display = st.session_state.top_stocks_df.copy()
+    # Optionally merge external model outputs (XGB weekly, LSTM predictions, Ensemble)
+    try:
+        import os as _os
+        import pandas as _pd
+        def _read_if_exists(path):
+            try:
+                return _pd.read_csv(path) if _os.path.exists(path) else None
+            except Exception:
+                return None
+        # Prefer merged weekly XGB output if present, else raw ranked
+        xgb_weekly = _read_if_exists('data/top/xgb_weekly_output.csv')
+        use_weekly = xgb_weekly is not None and 'ticker' in xgb_weekly.columns
+        xgb_csv = _read_if_exists('data/top/xgb_ranked_output.csv') or _read_if_exists('data/top/xgb_ranked.csv')
+        lstm_csv = _read_if_exists('data/top/lstm_weekly_predictions_output.csv') or _read_if_exists('data/top/lstm_weekly_predictions.csv')
+        ens_csv = _read_if_exists('data/top/ensemble_scores_output.csv') or _read_if_exists('data/top/final_ensemble_scores.csv')
+        if use_weekly:
+            df_to_display = xgb_weekly.copy()
+            df_to_display['ticker'] = df_to_display['ticker'].astype(str).str.upper()
+        else:
+            # Fallback to building from session state + ranked + features
+            # Prefer latest per-ticker features for clean 1:1 merges; fallback to full input
+            xgb_feat_csv = _read_if_exists('data/top/xgb_features_latest.csv') or _read_if_exists('data/top/xgb_features_input.csv')
+            # Prepare uppercase ticker keys
+            df_to_display['ticker'] = df_to_display['ticker'].astype(str).str.upper()
+            if xgb_csv is not None and 'ticker' in xgb_csv.columns:
+                xgb_csv['ticker'] = xgb_csv['ticker'].astype(str).str.upper()
+                # Disambiguate columns to avoid overwriting core fields
+                xgb_ren = {}
+                if 'confidence_score' in xgb_csv.columns:
+                    xgb_ren['confidence_score'] = 'xgb_confidence_score'
+                if 'predicted_return_pct' in xgb_csv.columns:
+                    xgb_ren['predicted_return_pct'] = 'xgb_predicted_return_pct'
+                xgb_csv = xgb_csv.rename(columns=xgb_ren)
+                df_to_display = df_to_display.merge(xgb_csv, on='ticker', how='left')
+            # Merge XGB feature inputs to expose all engineered columns in UI
+            if xgb_feat_csv is not None and 'ticker' in xgb_feat_csv.columns:
+                xgb_feat_csv['ticker'] = xgb_feat_csv['ticker'].astype(str).str.upper()
+                # If multiple dates exist, keep the latest per ticker to avoid row explosion
+                if 'date' in xgb_feat_csv.columns:
+                    try:
+                        xgb_feat_csv['date'] = _pd.to_datetime(xgb_feat_csv['date'], errors='coerce')
+                        xgb_feat_csv = xgb_feat_csv.sort_values(['ticker', 'date']).drop_duplicates(subset=['ticker'], keep='last')
+                    except Exception:
+                        pass
+                extra_cols = [c for c in xgb_feat_csv.columns if c != 'ticker' and c not in df_to_display.columns]
+                if extra_cols:
+                    df_to_display = df_to_display.merge(xgb_feat_csv[['ticker'] + extra_cols], on='ticker', how='left')
+                    try:
+                        st.caption(f"Merged XGB feature columns added: {len(extra_cols)}")
+                    except Exception:
+                        pass
+                # Backfill overlapping columns (e.g., rsi_14d) where current values are NaN
+                overlap_cols = [c for c in xgb_feat_csv.columns if c != 'ticker' and c in df_to_display.columns]
+                if overlap_cols:
+                    feat_subset = xgb_feat_csv[['ticker'] + overlap_cols]
+                    df_to_display = df_to_display.merge(feat_subset, on='ticker', how='left', suffixes=("", "_feat"))
+                    filled = 0
+                    for col in overlap_cols:
+                        feat_col = f"{col}_feat"
+                        if feat_col in df_to_display.columns:
+                            try:
+                                before_na = df_to_display[col].isna().sum()
+                                df_to_display[col] = df_to_display[col].combine_first(df_to_display[feat_col])
+                                after_na = df_to_display[col].isna().sum()
+                                filled += max(0, before_na - after_na)
+                            except Exception:
+                                pass
+                            try:
+                                df_to_display.drop(columns=[feat_col], inplace=True)
+                            except Exception:
+                                pass
+                    try:
+                        if filled > 0:
+                            st.caption(f"Backfilled {filled} missing values from XGB features (RSI/Momentum/Volume/etc.)")
+                    except Exception:
+                        pass
+        if lstm_csv is not None and 'ticker' in lstm_csv.columns:
+            lstm_csv['ticker'] = lstm_csv['ticker'].astype(str).str.upper()
+            df_to_display = df_to_display.merge(lstm_csv, on='ticker', how='left')
+        if ens_csv is not None and 'ticker' in ens_csv.columns:
+            ens_csv['ticker'] = ens_csv['ticker'].astype(str).str.upper()
+            # Merge ensemble score and any available model columns if present
+            ens_cols = [c for c in ['ensemble_score', 'xgb_pred', 'xgb_predicted_return_pct', 'lstm_predicted_return_pct'] if c in ens_csv.columns]
+            merge_cols = ['ticker'] + ens_cols if ens_cols else ['ticker']
+            df_to_display = df_to_display.merge(ens_csv[merge_cols], on='ticker', how='left')
+    except Exception:
+        pass
     
     # Format numeric columns
     if 'close' in df_to_display.columns:
         df_to_display['close'] = df_to_display['close'].apply(lambda x: f"${x:.2f}")
-    df_to_display['predicted_change'] = df_to_display['predicted_change'].apply(lambda x: f"${x:+.2f}")
-    df_to_display['predicted_return_pct'] = df_to_display['predicted_return_pct'].apply(lambda x: f"{x:+.2f}%")
-    df_to_display['confidence_score'] = df_to_display['confidence_score'].apply(lambda x: f"{x:.1f}")
-    df_to_display['risk_score'] = df_to_display['risk_score'].apply(lambda x: f"{x:.1f}")
-    df_to_display['composite_score'] = df_to_display['composite_score'].apply(lambda x: f"{x:.1f}")
+    if 'predicted_change' in df_to_display.columns:
+        df_to_display['predicted_change'] = df_to_display['predicted_change'].apply(lambda x: f"${x:+.2f}")
+    if 'predicted_return_pct' in df_to_display.columns:
+        df_to_display['predicted_return_pct'] = df_to_display['predicted_return_pct'].apply(lambda x: f"{x:+.2f}%")
+    if 'xgb_predicted_return_pct' in df_to_display.columns:
+        df_to_display['xgb_predicted_return_pct'] = df_to_display['xgb_predicted_return_pct'].apply(lambda x: f"{x:+.2f}%")
+    if 'lstm_predicted_return_pct' in df_to_display.columns:
+        df_to_display['lstm_predicted_return_pct'] = df_to_display['lstm_predicted_return_pct'].apply(lambda x: f"{x:+.2f}%")
+    if 'ensemble_score' in df_to_display.columns:
+        df_to_display['ensemble_score'] = df_to_display['ensemble_score'].apply(lambda x: f"{x:+.3f}")
+    if 'confidence_score' in df_to_display.columns:
+        df_to_display['confidence_score'] = df_to_display['confidence_score'].apply(lambda x: f"{x:.1f}")
+    if 'xgb_confidence_score' in df_to_display.columns:
+        df_to_display['xgb_confidence_score'] = df_to_display['xgb_confidence_score'].apply(lambda x: f"{x:.1f}")
+    if 'risk_score' in df_to_display.columns:
+        df_to_display['risk_score'] = df_to_display['risk_score'].apply(lambda x: f"{x:.1f}")
+    if 'composite_score' in df_to_display.columns:
+        df_to_display['composite_score'] = df_to_display['composite_score'].apply(lambda x: f"{x:.1f}")
     
     # Highlight rows also present in Momentum page (green background)
     try:
-        momentum_path = os.getenv('FEATURED_STOCKS_MOMENTUM_CSV', 'data/featured_stocks_momentum.csv')
+        momentum_path = os.getenv('FEATURED_STOCKS_MOMENTUM_CSV', 'data/momentum/featured_stocks_momentum.csv')
         mom_df = pd.read_csv(momentum_path)
         # Build winners like the Momentum page
         for col in ['momentum_30d','momentum_60d','trend_slope_15d','ma_20','macd','macd_signal','close']:
@@ -1536,8 +1700,17 @@ if analyze_button and symbol_input:
     
     # Load the featured data to get all available symbols
     try:
-        featured_stocks_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
-        featured_data = pd.read_csv(featured_stocks_path)
+        # Try env path, then standardized top location, then legacy default
+        env_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
+        try_paths = [env_path, 'data/top/featured_stocks_top.csv', 'data/featured_stocks_top.csv']
+        picked = None
+        for _p in try_paths:
+            if os.path.exists(_p):
+                picked = _p
+                break
+        if picked is None:
+            raise FileNotFoundError(f"No featured stocks CSV found in {try_paths}")
+        featured_data = pd.read_csv(picked)
         symbol_data = featured_data[featured_data['ticker'] == symbol_input]
         
         if symbol_data.empty:

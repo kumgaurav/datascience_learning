@@ -219,11 +219,15 @@ def _calculate_momentum(df):
         ticker_df['up_day_ratio_20d'] = daily_returns.rolling(window=20).apply(lambda r: np.mean(r > 0), raw=False)
 
         # 1. Define resistance as the highest price over the last 50 days, excluding today.
-        # We use .shift(1) to ensure we're comparing today's price to PAST resistance.
-        resistance_50d = ticker_df[price_col].rolling(window=50).max().shift(1)
+        #    Fallback to 20-day high when <50 days of history to avoid NaN-driven False.
+        resistance_50d = ticker_df[price_col].rolling(window=50, min_periods=1).max().shift(1)
+        resistance_20d = ticker_df[price_col].rolling(window=20, min_periods=1).max().shift(1)
 
-        # 2. The 'broke_resistance' flag is True if the current price is above that past high.
-        ticker_df['broke_resistance'] = ticker_df[price_col] > resistance_50d
+        # 2. The 'broke_resistance' flag is True if current price is above past high.
+        #    Use 50d when available; else fallback to 20d.
+        br_50 = ticker_df[price_col] > resistance_50d
+        br_20 = ticker_df[price_col] > resistance_20d
+        ticker_df['broke_resistance'] = br_50.where(~resistance_50d.isna(), br_20)
 
         # Days since last broke_resistance
         days_since = []
@@ -335,6 +339,8 @@ def create_all_features(master_df, prices_df, today=date.today()):
         featured_df['earnings_in_3_weeks'] = (featured_df['next_earnings_date'] - pd.to_datetime(today)).dt.days.between(0, 21)
     else:
         featured_df['earnings_in_3_weeks'] = False
+    # New signal: pre_earning_rally mirrors earnings_in_3_weeks
+    featured_df['pre_earning_rally'] = featured_df['earnings_in_3_weeks'].astype(bool)
     
     # Enhanced earnings surprise
     featured_df['last_eps_surprise_pct'] = featured_df.get('earnings_surprise_enhanced', 0)
@@ -458,7 +464,7 @@ def create_all_features(master_df, prices_df, today=date.today()):
         'golden_cross', 'death_cross', 'distance_from_support', 'distance_from_resistance', 'breakout_strength',
         'strong_momentum', 'risk_adjusted_momentum', 'breakout_confirmed', 'momentum_winner', 'trend_persistence_20d',
         'atr_14d', 'atr_pct', 'volume_zscore_20', 'volume_spike', 'gap_pct', 'gap_up_2pct', 'gap_down_2pct', 'relative_strength_20d',
-        'vol_adj_momentum_20d', 'days_since_last_broke_resistance', 'return_1d', 'days_since_last_earnings', 'weighted_confidence_score'
+        'vol_adj_momentum_20d', 'days_since_last_broke_resistance', 'return_1d', 'days_since_last_earnings', 'weighted_confidence_score', 'pre_earning_rally'
     ]
     
     # Ensure all columns exist, fill missing with appropriate defaults
@@ -466,7 +472,7 @@ def create_all_features(master_df, prices_df, today=date.today()):
         if col not in featured_df.columns:
             if col in ['earnings_in_3_weeks', 'positive_surprise_last_q', 'last_2q_positive_surprises', 
                       'bullish_momentum', 'strong_momentum', 'risk_adjusted_momentum', 'breakout_confirmed',
-                      'golden_cross', 'death_cross']:
+                      'golden_cross', 'death_cross', 'pre_earning_rally']:
                 featured_df[col] = False
             elif col == 'next_earnings_date':
                 featured_df[col] = pd.NaT

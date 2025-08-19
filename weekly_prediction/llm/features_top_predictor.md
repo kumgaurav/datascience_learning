@@ -46,3 +46,33 @@ Here’s a clean summary of your **feature selection, modeling approach, and str
 ---
 
 ✅ In short: You’re designing **event-driven + technical momentum features**, shifting prediction from *absolute price* → *relative price change*, and then ranking stocks by predicted return with bullish filters to pick the **top 20 candidates**.
+
+Here’s the highest-ROI plan, in priority order:
+
+1) Optimize for ranking (top-N), not MAE
+- XGBoost: switch to objective='rank:pairwise', time-based split, early_stopping_rounds=100; track NDCG@20/precision@20.
+- Weight ensemble by validation precision@20 (or IC), not MAE.
+
+2) Better target for weekly picks
+- Horizon = 10 trading days; label = rolling 5d sum of returns (smoothed).
+- Winsorize labels at 1–99th pct (keep).
+
+3) Add context features that move the needle
+- Market/sector: SPY 1–5d returns (you have 1d), VIX 1–5d, sector index return.
+- Risk model: 60d rolling beta to SPY and idiosyncratic (residual) returns.
+- Regime flag: high/low vol (e.g., VIX or realized vol percentile).
+
+4) LSTM upgrades (only if you keep it)
+- lookback=60, epochs=30–50, dropout=0.2, EarlyStopping(patience=5) + ReduceLROnPlateau.
+- Add per-date cross-sectional z-score (in addition to per-window).
+
+5) Validation you can trust
+- Rolling time-series CV; report precision@20 and IC by fold and by regime.
+- Keep strict time splits and leakage checks.
+
+Concrete defaults to try next:
+- XGB: depth=4, lr=0.03, subsample=0.8, colsample=0.8, min_child_weight=3, reg_lambda=1.0, n_estimators=3000 with early stopping.
+- Target: 10d horizon, 5d rolling-sum return, winsorize 1–99.
+- New features: 60d beta, residual returns, VIX 1–5d, sector 1–5d, vol regime flag.
+
+These changes most directly improve top-20 selection quality with minimal churn.

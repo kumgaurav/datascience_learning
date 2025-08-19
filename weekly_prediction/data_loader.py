@@ -63,6 +63,30 @@ def load_all_data(file_date: Optional[date] = None):
     master_df = pd.merge(master_df, earn_est, on='ticker', how='left')
     master_df = pd.merge(master_df, rev_est, on='ticker', how='left')
     master_df = pd.merge(master_df, growth_est, on='ticker', how='left')
+
+    # Override/derive next_earnings_date from stock_earnings.csv (earnings_date)
+    try:
+        # Use latest price date as the "today" anchor to avoid system clock drift
+        try:
+            today_ts = prices[correct_date_column].max().normalize()
+        except Exception:
+            today_ts = pd.Timestamp.today().normalize()
+        # Choose the next upcoming earnings_date per ticker (>= today)
+        next_earn = (
+            earnings[earnings['earnings_date'] >= today_ts]
+            .sort_values(['ticker', 'earnings_date'])
+            .groupby('ticker', as_index=False)
+            .first()[['ticker', 'earnings_date']]
+            .rename(columns={'earnings_date': 'next_earnings_date'})
+        )
+        master_df = pd.merge(master_df, next_earn, on='ticker', how='left', suffixes=('', '_from_earnings'))
+        # If an estimate also provided next_earnings_date, prefer the explicit upcoming date from earnings file
+        if 'next_earnings_date_from_earnings' in master_df.columns:
+            master_df['next_earnings_date'] = master_df['next_earnings_date_from_earnings'].combine_first(master_df.get('next_earnings_date'))
+            master_df.drop(columns=['next_earnings_date_from_earnings'], inplace=True)
+    except Exception:
+        # If anything fails, keep existing estimate-based next_earnings_date
+        pass
     
     print("All data files loaded and merged successfully.")
     

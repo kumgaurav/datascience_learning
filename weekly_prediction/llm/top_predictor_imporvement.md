@@ -85,3 +85,19 @@ python stocks/execute_data_creator.py
 # 2) Run the pipeline with ranking model + LSTM upgrades
 python run_pipeline_v2.py --prices data/stock_prices.csv --horizon 10 --lookback 30 --top_n 20
 
+now i need help to understand our prediction is predicting HCA will have a good return but at the same time when checking best 25 stocks by 5d,15d and 30d returns HCA does not appear in any of it. why model is predicting it is in best 20 stocks for next week
+
+
+Short answer: the model is forecasting next week’s return from many signals, while the 5d/15d/30d lists are backward-looking realized-return leaderboards. It’s normal for a stock to not be a recent top performer yet still score highly on forward-looking features (e.g., resistance break, post-earnings dip rally, improving trend slopes, low risk, etc.). Also note: the momentum lists come from a different data slice than the model’s feature dataset, so universe/features may differ.
+
+To verify in your data:
+- Check HCA’s feature row used for prediction (defaults to `data/xgb_features_latest.csv` or `FEATURED_STOCKS_CSV`): look at `predicted_return_pct`, `signal_pos_count`, `momentum_pos_count`, `broke_resistance`, `post_earnings_dip_rally`, `trend_slope_*`, `rsi_14d`.
+- Confirm HCA’s trailing returns aren’t top-25 in `data/momentum/top5d_performers.csv`, `top15d_performers.csv`, `top30d_performers.csv`.
+- In `stock_selector_v2.rank_stocks`, note the bullish filter lets through stocks with `broke_resistance` or `post_earnings_dip_rally`; the confidence score multiplies the prediction by (1 + signal_pos_count + momentum_pos_count), which can boost rank even if recent 5d/15d/30d returns aren’t top-25.
+
+If you want, I can add a small “Explain prediction” panel to show for any ticker:
+- the model’s `predicted_return_pct`
+- which positive signals fired
+- `momentum_pos_count`, `signal_pos_count`
+- key features and top contributing feature (SHAP)
+

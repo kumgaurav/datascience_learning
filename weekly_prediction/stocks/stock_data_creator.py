@@ -134,6 +134,15 @@ def transform_dataframe_for_table(table_name: str, df: pd.DataFrame) -> pd.DataF
         # Enforce column order (and drop extras to match exact order requested)
         df = df[required_order]
 
+        # --- Build diagnostics per ticker (before filtering) ---
+        try:
+            latest_close = df.sort_values("date").groupby("ticker").tail(1).set_index("ticker")["close"]
+            avg_volume = df.groupby("ticker")["volume"].mean().rename("avg_volume")
+            num_rows = df.groupby("ticker")["date"].size().rename("rows_2y")
+            diag = pd.concat([latest_close, avg_volume, num_rows], axis=1)
+        except Exception:
+            diag = None
+
         # ----- Liquidity/penny filters (based on latest close and avg volume over window) -----
         try:
             # Ensure numeric dtypes
@@ -154,6 +163,8 @@ def transform_dataframe_for_table(table_name: str, df: pd.DataFrame) -> pd.DataF
                 dropped = before_tickers - after_tickers
                 if dropped > 0:
                     print(f"[stocksinfp] Dropped {dropped} illiquid/penny tickers (<$3 or avg vol <300k). Kept {after_tickers}.")
+            if diag is not None:
+                diag["pass_liquidity"] = diag.apply(lambda r: (r.get("close", 0) >= 3.0) and (r.get("avg_volume", 0) >= 300_000), axis=1)
         except Exception as exc:
             print(f"[stocksinfp] Liquidity filter skipped due to error: {exc}")
 
@@ -203,11 +214,23 @@ def transform_dataframe_for_table(table_name: str, df: pd.DataFrame) -> pd.DataF
                         f"[stocksinfp] Relaxed length filter (min_required={min_required}, AAPL={aapl_rows}). "
                         f"Removed {removed_tickers} tickers and {removed_rows} rows; kept {after_tickers} tickers."
                     )
+                if diag is not None:
+                    diag["pass_length"] = diag.index.map(lambda t: counts.get(t, 0) >= min_required)
             else:
                 print("[stocksinfp] AAPL not found; skipping equal-length ticker filter.")
         except Exception as exc:
             # Do not fail export due to filtering; just report
             print(f"[stocksinfp] Skipped equal-length filter due to error: {exc}")
+
+        # Persist diagnostics report
+        try:
+            if diag is not None:
+                out_dir = Path("data") / "top"
+                ensure_directory(out_dir)
+                diag.reset_index().rename(columns={"index":"ticker"}).to_csv(out_dir / "data_creation_report.csv", index=False)
+                print(f"[stocksinfp] Wrote data creation diagnostics to {out_dir / 'data_creation_report.csv'}")
+        except Exception:
+            pass
 
     return df
 
@@ -256,6 +279,29 @@ class StockDataCreator:
 
         output_path = self.data_dir / f"{final_csv_name}.csv"
         df = read_table(self.engine, table_name)
+        # For stocksinfp, also write an unfiltered normalized input dump
+        if table_name == "stocksinfp":
+            try:
+                df_input = df.copy()
+                # Normalize columns
+                df_input.columns = [str(c).lower() for c in df_input.columns]
+                if "symbol" in df_input.columns:
+                    df_input = df_input.rename(columns={"symbol": "ticker"})
+                # Ensure expected order if present
+                required_order = ["date", "ticker", "close", "high", "low", "open", "volume"]
+                # Coerce date and sort, but DO NOT drop rows
+                if "date" in df_input.columns:
+                    df_input["date"] = pd.to_datetime(df_input["date"], errors="coerce")
+                # Restrict to columns present to avoid KeyError
+                cols_present = [c for c in required_order if c in df_input.columns]
+                df_input = df_input[cols_present]
+                if set(["ticker", "date"]).issubset(df_input.columns):
+                    df_input = df_input.sort_values(["ticker", "date"]) 
+                save_dataframe_as_csv(df_input, self.data_dir / "stock_prices_input.csv")
+                print(f"[stocksinfp] Wrote unfiltered normalized input to {self.data_dir / 'stock_prices_input.csv'}")
+            except Exception as exc:
+                print(f"[stocksinfp] Failed to write stock_prices_input.csv: {exc}")
+
         df = transform_dataframe_for_table(table_name, df)
         save_dataframe_as_csv(df, output_path)
         return output_path

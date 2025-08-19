@@ -305,21 +305,55 @@ class XGBTrainer(BaseModelTrainer):
         else:
             val_group = []
 
-        # Sample weights emphasizing bullish signals
-        sw = np.ones(len(inner_train_df), dtype=float)
-        for col, weight in [
-            ('broke_resistance', 0.6),
-            ('breakout_confirmed', 0.6),
-            ('strong_momentum', 0.4),
-            ('post_earnings_dip_rally', 0.6),
-            ('low_volatility', 0.2),
-            ('volume_above_avg', 0.2),
-        ]:
-            if col in inner_train_df.columns:
-                sw += inner_train_df[col].astype(int).values * weight
-        if 'signal_pos_count' in inner_train_df.columns:
-            no_signal_mask = (inner_train_df['signal_pos_count'] == 0).values
-            sw[no_signal_mask] *= 0.7
+        # Sample weights (requested scheme):
+        # signal_weight = 1.0 + 0.5 per positive of {broke_resistance, breakout_confirmed, post_earnings_dip_rally}
+        # weight = signal_weight * (1 + 0.5 * recent_return_score)
+        # where recent_return_score ∈ [0,1] from normalized realized returns (5d/15d/30d)
+        # and final weight is clamped to [0.5, 3.0]
+
+        def _pick_first_present_col(df_local: pd.DataFrame, candidates: list[str]) -> pd.Series:
+            vals = pd.Series([None] * len(df_local), index=df_local.index, dtype='float64')
+            for c in candidates:
+                if c in df_local.columns:
+                    s = pd.to_numeric(df_local[c], errors='coerce')
+                    vals = vals.where(~vals.isna(), s)
+            return vals.fillna(0.0)
+
+        def _norm_rank_within_date(df_local: pd.DataFrame, series: pd.Series) -> pd.Series:
+            try:
+                # Higher is better → descending rank; map to [0,1]
+                r = series.groupby(df_local['date']).rank(method='min', ascending=False)
+                sz = df_local.groupby('date')['date'].transform('size').astype(float)
+                score = 1.0 - (r - 1.0) / sz.clip(lower=1.0)
+                return score.fillna(0.0)
+            except Exception:
+                return pd.Series(0.0, index=df_local.index)
+
+        # Build recent return score on inner_train_df
+        s5 = _pick_first_present_col(inner_train_df, ['price_change_5d_pct', 'return_5d', 'momentum_5d'])
+        s15 = _pick_first_present_col(inner_train_df, ['price_change_15d_pct', 'return_15d', 'momentum_15d'])
+        s30 = _pick_first_present_col(inner_train_df, ['price_change_30d_pct', 'return_30d', 'momentum_30d'])
+        score5 = _norm_rank_within_date(inner_train_df, s5)
+        score15 = _norm_rank_within_date(inner_train_df, s15)
+        score30 = _norm_rank_within_date(inner_train_df, s30)
+        recent_return_score = 0.4 * score5 + 0.3 * score15 + 0.3 * score30
+
+        # Signal component (include pre-earnings rally)
+        br = inner_train_df.get('broke_resistance', False)
+        bc = inner_train_df.get('breakout_confirmed', False)
+        pedr = inner_train_df.get('post_earnings_dip_rally', False)
+        # pre_earning_rally: prefer explicit flag; fallback to earnings_in_3_weeks
+        per = inner_train_df.get('pre_earning_rally', inner_train_df.get('earnings_in_3_weeks', False))
+        br = br.astype(int) if hasattr(br, 'astype') else int(bool(br))
+        bc = bc.astype(int) if hasattr(bc, 'astype') else int(bool(bc))
+        pedr = pedr.astype(int) if hasattr(pedr, 'astype') else int(bool(pedr))
+        per = per.astype(int) if hasattr(per, 'astype') else int(bool(per))
+        signal_weight = 1.0 + 0.5 * (br.values if hasattr(br, 'values') else br) \
+                               + 0.5 * (bc.values if hasattr(bc, 'values') else bc) \
+                               + 0.5 * (pedr.values if hasattr(pedr, 'values') else pedr) \
+                               + 0.5 * (per.values if hasattr(per, 'values') else per)
+
+        sw = signal_weight * (1.0 + 0.5 * recent_return_score.to_numpy())
         sw = np.clip(sw, 0.5, 3.0)
 
         # Parameter search optimizing Precision@20 on validation (Optuna optional)
