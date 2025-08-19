@@ -12,7 +12,7 @@ st.set_page_config(page_title="Momentum Winners", page_icon="🚀", layout="wide
 
 
 def load_featured() -> pd.DataFrame:
-    featured_path = os.getenv('FEATURED_STOCKS_MOMENTUM_CSV', 'data/featured_stocks_momentum.csv')
+    featured_path = os.getenv('FEATURED_STOCKS_MOMENTUM_CSV', 'data/momentum/featured_stocks_momentum.csv')
     return pd.read_csv(featured_path)
 
 
@@ -102,131 +102,217 @@ try:
     featured = load_featured()
     prices = load_prices()
 
-    winners = compute_momentum_winners(featured)
-    # Filter out low-priced stocks (< $2)
-    winners['close'] = pd.to_numeric(winners['close'], errors='coerce')
-    winners = winners[winners['close'] >= 2].copy()
-    
-    # Add weekly predictions
-    winners = predict_weekly_returns(winners)
-    # Sort primarily by predicted weekly return (desc), fallback to momentum score
-    if 'predicted_weekly_return_pct' in winners.columns:
-        winners = winners.sort_values('predicted_weekly_return_pct', ascending=False)
-    elif 'mw_score' in winners.columns:
-        winners = winners.sort_values('mw_score', ascending=False)
+    # Sub-tabs: 5d / 15d / 30d Momentum
+    import os
+    import pandas as _pd
+    mom5_path = os.path.join('data', 'momentum', 'top5d_performers.csv')
+    mom15_path = os.path.join('data', 'momentum', 'top15d_performers.csv')
+    mom30_path = os.path.join('data', 'momentum', 'top30d_performers.csv')
 
-    if winners.empty:
-        st.info("No momentum winners matched the current rules. Re-run analysis or refresh data.")
-    else:
-        # Top 20 table
-        st.subheader("Top 20 Momentum Winners")
-        top20 = winners.head(20).copy()
-        cols = [
-            c for c in [
-                'ticker', 'close', 'predicted_weekly_return_pct', 'momentum_20d', 'momentum_30d', 'momentum_60d',
-                'up_day_ratio_20d', 'rsi_14d', 'mw_score'
-            ] if c in top20.columns
-        ]
-        table = top20[cols].copy()
-        if 'close' in table.columns:
-            table['close'] = table['close'].map(lambda x: f"${x:.2f}")
-        if 'predicted_weekly_return_pct' in table.columns:
-            table['predicted_weekly_return_pct'] = table['predicted_weekly_return_pct'].map(lambda x: f"{x:.2f}%")
-        for c in ['momentum_20d', 'momentum_30d', 'momentum_60d', 'up_day_ratio_20d']:
-            if c in table.columns:
-                if c == 'up_day_ratio_20d':
-                    table[c] = table[c].map(lambda x: f"{x*100:.1f}%")
-                else:
-                    table[c] = table[c].map(lambda x: f"{x*100:.1f}%")
-        if 'mw_score' in table.columns:
-            table['mw_score'] = table['mw_score'].map(lambda x: f"{x:.3f}")
-        # Highlight rows that also appear in Top Stocks (from main page)
-        top_set = set()
+    df5 = _pd.read_csv(mom5_path) if os.path.exists(mom5_path) else _pd.DataFrame()
+    df15 = _pd.read_csv(mom15_path) if os.path.exists(mom15_path) else _pd.DataFrame()
+    df30 = _pd.read_csv(mom30_path) if os.path.exists(mom30_path) else _pd.DataFrame()
+
+    # Ensure ticker is string for set ops
+    for _df in (df5, df15, df30):
+        if not _df.empty and 'ticker' in _df.columns:
+            _df['ticker'] = _df['ticker'].astype(str).str.upper()
+
+    s5 = set(df5['ticker']) if not df5.empty and 'ticker' in df5.columns else set()
+    s15 = set(df15['ticker']) if not df15.empty and 'ticker' in df15.columns else set()
+    s30 = set(df30['ticker']) if not df30.empty and 'ticker' in df30.columns else set()
+
+    common_all = s5 & s15 & s30
+    common_5_15_only = (s5 & s15) - s30
+    common_15_30_only = (s15 & s30) - s5
+
+    def _row_color_style(row):
+        t = str(row.get('ticker', '')).upper()
+        if t in common_all:
+            color = '#c8e6c9'  # green
+        elif t in common_5_15_only:
+            color = '#bbdefb'  # blue
+        elif t in common_15_30_only:
+            color = '#fff9c4'  # yellow
+        else:
+            color = ''
+        return [f'background-color: {color}' if color else '' for _ in row]
+
+    tab5, tab15, tab30 = st.tabs(["Top 5d", "Top 15d", "Top 30d"])
+
+    def _render_5d_tab():
+        df_src = df5
+        if df_src is None or df_src.empty:
+            st.info("No data available for this timeframe.")
+            return
+        st.markdown(
+            "Row color legend: "
+            "<span style='background-color:#c8e6c9;padding:2px 6px;border-radius:3px;'>Green</span> = common in 5d, 15d, 30d; "
+            "<span style='background-color:#bbdefb;padding:2px 6px;border-radius:3px;'>Blue</span> = common in 5d & 15d only; "
+            "<span style='background-color:#fff9c4;padding:2px 6px;border-radius:3px;'>Yellow</span> = common in 15d & 30d only",
+            unsafe_allow_html=True
+        )
+        def _row_color_style_5d(row):
+            t = str(row.get('ticker', '')).upper()
+            if t in common_all:
+                color = '#c8e6c9'
+            elif t in common_5_15_only:
+                color = '#bbdefb'
+            elif t in common_15_30_only:
+                color = '#fff9c4'
+            else:
+                color = ''
+            return [f'background-color: {color}' if color else '' for _ in row]
         try:
-            if 'top_stocks_df' in st.session_state and not st.session_state.top_stocks_df.empty:
-                top_set = set(st.session_state.top_stocks_df['ticker'].astype(str).tolist())
-        except Exception:
-            top_set = set()
-
-        def _row_style(row: pd.Series):
-            highlight = (row.get('ticker') in top_set)
-            style = 'background-color: #2e7d32; color: white' if highlight else ''
-            return [style] * len(row)
-
-        try:
-            styled = table.style.apply(_row_style, axis=1)
+            styled = df_src.style.apply(_row_color_style_5d, axis=1)
             st.dataframe(styled, use_container_width=True, hide_index=True)
         except Exception:
-            st.dataframe(table, use_container_width=True, hide_index=True)
+            st.dataframe(df_src, use_container_width=True, hide_index=True)
+        st.subheader("🔍 Analyze")
+        tickers = df_src['ticker'].tolist() if 'ticker' in df_src.columns else []
+        sel = st.selectbox("Select ticker", tickers, key="sel_5d")
+        analyze = st.button("Analyze", type="primary", key="analyze_5d")
+        if analyze and sel:
+            try:
+                feat_row = None
+                if featured is not None and isinstance(featured, _pd.DataFrame) and not featured.empty:
+                    _feat = featured[featured['ticker'].astype(str).str.upper() == sel]
+                    if not _feat.empty:
+                        feat_row = _feat.iloc[0]
+                if feat_row is None:
+                    feat_row = _pd.Series({'ticker': sel, 'close': _pd.NA})
+                tpx = prices[prices['ticker'].astype(str).str.upper() == sel].copy() if prices is not None else _pd.DataFrame()
+                if not tpx.empty:
+                    tpx['date'] = _pd.to_datetime(tpx['date'])
+                    tpx = tpx.sort_values('date')
+                    start_dt = tpx['date'].max() - timedelta(days=90)
+                    recent = tpx[tpx['date'] >= start_dt].copy()
+                    chart = create_stock_price_chart(sel, recent, feat_row)
+                    if chart:
+                        st.plotly_chart(chart, use_container_width=True)
+                else:
+                    st.warning(f"No price data found for {sel}")
+            except Exception as _e:
+                st.warning(f"Could not render analysis for {sel}: {str(_e)}")
 
-        # Selection for deep dive
-        st.subheader("🔍 Analyze a Winner")
-        sel = st.selectbox("Select ticker", top20['ticker'].tolist())
-
-        if sel:
-            row = winners[winners['ticker'] == sel].iloc[0]
-            tpx = prices[prices['ticker'] == sel].copy()
-
-            if not tpx.empty:
-                tpx['date'] = pd.to_datetime(tpx['date'])
-                tpx = tpx.sort_values('date')
-                start_dt = tpx['date'].max() - timedelta(days=90)
-                recent = tpx[tpx['date'] >= start_dt].copy()
-
-                # Chart
-                chart = create_stock_price_chart(sel, recent, row)
-                if chart:
-                    st.plotly_chart(chart, use_container_width=True)
-
-                # Metrics
-                st.subheader("📈 Momentum Metrics")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Price", f"${row.get('close', 0):.2f}")
-                with col2:
-                    st.metric("Predicted Weekly Return", f"{row.get('predicted_weekly_return_pct', 0):.2f}%")
-                with col3:
-                    st.metric("30d Momentum", f"{row.get('momentum_30d', 0)*100:.1f}%")
-                with col4:
-                    st.metric("60d Momentum", f"{row.get('momentum_60d', 0)*100:.1f}%")
-
-                colx1, colx2 = st.columns(2)
-                with colx1:
-                    st.metric("Up-Day Ratio (20d)", f"{row.get('up_day_ratio_20d', 0)*100:.1f}%")
-                with colx2:
-                    st.metric("Momentum (20d)", f"{row.get('momentum_20d', 0)*100:.1f}%")
-
-                col5, col6, col7, col8 = st.columns(4)
-                with col5:
-                    st.metric("RSI (14d)", f"{row.get('rsi_14d', 0):.1f}")
-                with col6:
-                    st.metric("MACD", f"{row.get('macd', 0):.3f}")
-                with col7:
-                    st.metric("Signal", f"{row.get('macd_signal', 0):.3f}")
-                with col8:
-                    st.metric("Trend Slope (30d)", f"{row.get('trend_slope_30d', 0):.3f}")
-
-                # Explanations
-                st.subheader("📝 Why it qualifies")
-                reasons = []
-                if row.get('momentum_60d', 0) > 0.5:
-                    reasons.append("60d momentum > 50%")
-                if row.get('momentum_30d', 0) > 0.2:
-                    reasons.append("30d momentum > 20%")
-                if row.get('up_day_ratio_20d', 0) > 0.55:
-                    reasons.append("Up-day ratio > 55% over last 20d")
-                if row.get('close', 0) > row.get('ma_20', 0):
-                    reasons.append("Price above 20d MA")
-                if row.get('macd', 0) > row.get('macd_signal', 0):
-                    reasons.append("MACD > Signal (positive momentum)")
-                if row.get('golden_cross', False):
-                    reasons.append("Golden Cross detected")
-                if not reasons:
-                    reasons.append("Meets custom persistence criteria")
-                st.write("- " + "\n- ".join(reasons))
-
+    def _render_15d_tab():
+        df_src = df15
+        if df_src is None or df_src.empty:
+            st.info("No data available for this timeframe.")
+            return
+        st.markdown(
+            "Row color legend: "
+            "<span style='background-color:#c8e6c9;padding:2px 6px;border-radius:3px;'>Green</span> = common in 5d, 15d, 30d; "
+            "<span style='background-color:#bbdefb;padding:2px 6px;border-radius:3px;'>Blue</span> = common in 5d & 15d only; "
+            "<span style='background-color:#fff9c4;padding:2px 6px;border-radius:3px;'>Yellow</span> = common in 15d & 30d only",
+            unsafe_allow_html=True
+        )
+        def _row_color_style_15d(row):
+            t = str(row.get('ticker', '')).upper()
+            if t in common_all:
+                color = '#c8e6c9'
+            elif t in common_5_15_only:
+                color = '#bbdefb'
+            elif t in common_15_30_only:
+                color = '#fff9c4'
             else:
-                st.warning(f"No price data found for {sel}")
+                color = ''
+            return [f'background-color: {color}' if color else '' for _ in row]
+        try:
+            styled = df_src.style.apply(_row_color_style_15d, axis=1)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(df_src, use_container_width=True, hide_index=True)
+        st.subheader("🔍 Analyze")
+        tickers = df_src['ticker'].tolist() if 'ticker' in df_src.columns else []
+        sel = st.selectbox("Select ticker", tickers, key="sel_15d")
+        analyze = st.button("Analyze", type="primary", key="analyze_15d")
+        if analyze and sel:
+            try:
+                feat_row = None
+                if featured is not None and isinstance(featured, _pd.DataFrame) and not featured.empty:
+                    _feat = featured[featured['ticker'].astype(str).str.upper() == sel]
+                    if not _feat.empty:
+                        feat_row = _feat.iloc[0]
+                if feat_row is None:
+                    feat_row = _pd.Series({'ticker': sel, 'close': _pd.NA})
+                tpx = prices[prices['ticker'].astype(str).str.upper() == sel].copy() if prices is not None else _pd.DataFrame()
+                if not tpx.empty:
+                    tpx['date'] = _pd.to_datetime(tpx['date'])
+                    tpx = tpx.sort_values('date')
+                    start_dt = tpx['date'].max() - timedelta(days=90)
+                    recent = tpx[tpx['date'] >= start_dt].copy()
+                    chart = create_stock_price_chart(sel, recent, feat_row)
+                    if chart:
+                        st.plotly_chart(chart, use_container_width=True)
+                else:
+                    st.warning(f"No price data found for {sel}")
+            except Exception as _e:
+                st.warning(f"Could not render analysis for {sel}: {str(_e)}")
+
+    def _render_30d_tab():
+        df_src = df30
+        if df_src is None or df_src.empty:
+            st.info("No data available for this timeframe.")
+            return
+        st.markdown(
+            "Row color legend: "
+            "<span style='background-color:#c8e6c9;padding:2px 6px;border-radius:3px;'>Green</span> = common in 5d, 15d, 30d; "
+            "<span style='background-color:#bbdefb;padding:2px 6px;border-radius:3px;'>Blue</span> = common in 5d & 15d only; "
+            "<span style='background-color:#fff9c4;padding:2px 6px;border-radius:3px;'>Yellow</span> = common in 15d & 30d only",
+            unsafe_allow_html=True
+        )
+        def _row_color_style_30d(row):
+            t = str(row.get('ticker', '')).upper()
+            if t in common_all:
+                color = '#c8e6c9'
+            elif t in common_5_15_only:
+                color = '#bbdefb'
+            elif t in common_15_30_only:
+                color = '#fff9c4'
+            else:
+                color = ''
+            return [f'background-color: {color}' if color else '' for _ in row]
+        try:
+            styled = df_src.style.apply(_row_color_style_30d, axis=1)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(df_src, use_container_width=True, hide_index=True)
+        st.subheader("🔍 Analyze")
+        tickers = df_src['ticker'].tolist() if 'ticker' in df_src.columns else []
+        sel = st.selectbox("Select ticker", tickers, key="sel_30d")
+        analyze = st.button("Analyze", type="primary", key="analyze_30d")
+        if analyze and sel:
+            try:
+                feat_row = None
+                if featured is not None and isinstance(featured, _pd.DataFrame) and not featured.empty:
+                    _feat = featured[featured['ticker'].astype(str).str.upper() == sel]
+                    if not _feat.empty:
+                        feat_row = _feat.iloc[0]
+                if feat_row is None:
+                    feat_row = _pd.Series({'ticker': sel, 'close': _pd.NA})
+                tpx = prices[prices['ticker'].astype(str).str.upper() == sel].copy() if prices is not None else _pd.DataFrame()
+                if not tpx.empty:
+                    tpx['date'] = _pd.to_datetime(tpx['date'])
+                    tpx = tpx.sort_values('date')
+                    start_dt = tpx['date'].max() - timedelta(days=90)
+                    recent = tpx[tpx['date'] >= start_dt].copy()
+                    chart = create_stock_price_chart(sel, recent, feat_row)
+                    if chart:
+                        st.plotly_chart(chart, use_container_width=True)
+                else:
+                    st.warning(f"No price data found for {sel}")
+            except Exception as _e:
+                st.warning(f"Could not render analysis for {sel}: {str(_e)}")
+
+    with tab5:
+        _render_5d_tab()
+    with tab15:
+        _render_15d_tab()
+    with tab30:
+        _render_30d_tab()
+
+    # Removed Top 20 Momentum Winners and related components as requested
 except Exception as e:
     st.error(f"Error rendering Momentum Winners page: {str(e)}")
 
