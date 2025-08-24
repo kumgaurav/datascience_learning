@@ -28,6 +28,15 @@ def load_ensemble_weekly() -> pd.DataFrame:
     }
     df = df.rename(columns=rename_map)
     return df
+@st.cache_data(show_spinner=False)
+def load_ui_unified() -> pd.DataFrame:
+    base = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    csv_path = os.path.join(base, "data", "features", "ui_unified_features.csv")
+    df = _read_csv_if_exists(csv_path)
+    if 'ticker' in df.columns:
+        df['ticker'] = df['ticker'].astype(str).str.upper()
+    return df
+
 
 
 @st.cache_data(show_spinner=False)

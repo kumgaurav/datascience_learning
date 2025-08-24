@@ -224,6 +224,8 @@ def fetch_all(output_dir: str = "data/input", start_date: Optional[str] = None, 
         "quarterly_revenue": os.getenv("Q_REVENUE_TABLE", "quarterly_revenue"),
         "revenue_estimates": os.getenv("REVENUE_EST_TABLE", "revenue_estimates"),
         "growth_estimates": os.getenv("GROWTH_EST_TABLE", "growth_estimates"),
+        # Direct earnings history export (preferred): set EARNINGS_HISTORY_TABLE to a view/table providing the desired schema
+        "earnings_history": os.getenv("EARNINGS_HISTORY_TABLE", "earnings_history"),
     }
 
     # Override table names from conf/config.ini if present; collect date col overrides too
@@ -277,6 +279,7 @@ def fetch_all(output_dir: str = "data/input", start_date: Optional[str] = None, 
         "quarterly_revenue": "report_date",
         "revenue_estimates": "next_earnings_date",
         "growth_estimates": None,
+        "earnings_history": "earnings_date",
     }
     # Apply INI overrides
     if ini_date_overrides:
@@ -366,12 +369,15 @@ def fetch_all(output_dir: str = "data/input", start_date: Optional[str] = None, 
         if key == "stock_prices":
             df = _normalize_prices_columns(df)
             df = _standardize_stock_price_column_names(df)
-        else:
+        elif key in ("stock_earnings","earnings_estimates","quarterly_income","quarterly_revenue","revenue_estimates","growth_estimates"):
             try:
                 if "ticker" in df.columns:
                     df["ticker"] = df["ticker"].astype(str).str.upper()
             except Exception:
                 pass
+        elif key == "earnings_history":
+            # For earnings_history, write CSV exactly as selected from DB; do not transform columns
+            pass
         out_path = os.path.join(output_dir, f"{key}.csv")
         try:
             df.to_csv(out_path, index=False)
@@ -437,6 +443,138 @@ def fetch_all(output_dir: str = "data/input", start_date: Optional[str] = None, 
             print("[DB] stock_prices not found; skipping cleaned/uncleaned generation.")
     except Exception as e:
         print(f"[DB] Failed to build stock_prices_with_clean/unclean_data: {e}")
+
+    # If earnings_history table/view exists we already wrote it; otherwise, attempt to compose from parts as fallback
+    try:
+        earn_p = out_paths.get("stock_earnings")
+        est_p = out_paths.get("earnings_estimates")
+        qrev_p = out_paths.get("quarterly_revenue")
+        rev_est_p = out_paths.get("revenue_estimates")
+        # Skip composition if direct export was available
+        if out_paths.get('earnings_history') and os.path.exists(out_paths['earnings_history']):
+            return out_paths
+        if earn_p and os.path.exists(earn_p):
+            df_e = pd.read_csv(earn_p)
+            # normalize column names for merge
+            ecols = {c.lower(): c for c in df_e.columns}
+            tcol_e = ecols.get('ticker') or ecols.get('symbol')
+            dcol_e = ecols.get('earnings_date') or ecols.get('date')
+            rep_eps_col = ecols.get('reported_eps') or ecols.get('actualeps') or ecols.get('eps')
+            df_e = df_e.rename(columns={
+                tcol_e: 'ticker',
+                dcol_e: 'earnings_date',
+                rep_eps_col: 'reported_eps'
+            }) if tcol_e and dcol_e and rep_eps_col else df_e
+            df_e['ticker'] = df_e.get('ticker', pd.Series([], dtype=str)).astype(str).str.upper()
+        else:
+            df_e = pd.DataFrame()
+
+        if est_p and os.path.exists(est_p):
+            df_est = pd.read_csv(est_p)
+            estcols = {c.lower(): c for c in df_est.columns}
+            tcol_s = estcols.get('ticker') or estcols.get('symbol')
+            dcol_s = estcols.get('earnings_date') or estcols.get('date')
+            est_eps_col = estcols.get('estimate_eps') or estcols.get('epsestimate') or estcols.get('estimate')
+            df_est = df_est.rename(columns={
+                tcol_s: 'ticker',
+                dcol_s: 'earnings_date',
+                est_eps_col: 'estimate_eps'
+            }) if tcol_s and dcol_s and est_eps_col else df_est
+            df_est['ticker'] = df_est.get('ticker', pd.Series([], dtype=str)).astype(str).str.upper()
+        else:
+            df_est = pd.DataFrame()
+
+        # Merge on ticker + earnings_date when possible
+        needed_cols = {'ticker','earnings_date','reported_eps','estimate_eps','surprise_percentage'}
+        if not df_e.empty and needed_cols.issubset(set(df_e.columns)):
+            base = df_e[list(needed_cols)].copy()
+        elif not df_e.empty and not df_est.empty and 'ticker' in df_e.columns and 'earnings_date' in df_e.columns and 'ticker' in df_est.columns and 'earnings_date' in df_est.columns:
+            try:
+                df_e['earnings_date'] = pd.to_datetime(df_e['earnings_date'], errors='coerce')
+                df_est['earnings_date'] = pd.to_datetime(df_est['earnings_date'], errors='coerce')
+            except Exception:
+                pass
+            base = pd.merge(df_e, df_est, on=['ticker', 'earnings_date'], how='outer')
+        else:
+            # Fallback: just use whichever exists
+            base = df_e if not df_e.empty else df_est
+
+        # Attach revenue if available
+        if qrev_p and os.path.exists(qrev_p):
+            try:
+                df_rev = pd.read_csv(qrev_p)
+                rcols = {c.lower(): c for c in df_rev.columns}
+                tcol_r = rcols.get('ticker') or rcols.get('symbol')
+                dcol_r = rcols.get('report_date') or rcols.get('date')
+                rev_col = rcols.get('revenue') or rcols.get('totalrevenue')
+                df_rev = df_rev.rename(columns={
+                    tcol_r: 'ticker',
+                    dcol_r: 'earnings_date',
+                    rev_col: 'reported_revenue'
+                }) if tcol_r and dcol_r and rev_col else df_rev
+                df_rev['ticker'] = df_rev.get('ticker', pd.Series([], dtype=str)).astype(str).str.upper()
+                try:
+                    df_rev['earnings_date'] = pd.to_datetime(df_rev['earnings_date'], errors='coerce')
+                except Exception:
+                    pass
+                if not base.empty and 'ticker' in base.columns and 'earnings_date' in base.columns:
+                    base = pd.merge(base, df_rev[['ticker','earnings_date','reported_revenue']], on=['ticker','earnings_date'], how='left')
+            except Exception as e:
+                print(f"[DB] Failed to attach revenue to earnings_history: {e}")
+
+        # Attach revenue estimates if available
+        if rev_est_p and os.path.exists(rev_est_p):
+            try:
+                df_rev_est = pd.read_csv(rev_est_p)
+                rcols = {c.lower(): c for c in df_rev_est.columns}
+                tcol = rcols.get('ticker') or rcols.get('symbol')
+                dcol = rcols.get('earnings_date') or rcols.get('next_earnings_date') or rcols.get('date')
+                est_col = rcols.get('estimate_revenue') or rcols.get('revenueestimate') or rcols.get('estimate')
+                df_rev_est = df_rev_est.rename(columns={
+                    tcol: 'ticker',
+                    dcol: 'earnings_date',
+                    est_col: 'estimate_revenue'
+                }) if tcol and dcol and est_col else df_rev_est
+                df_rev_est['ticker'] = df_rev_est.get('ticker', pd.Series([], dtype=str)).astype(str).str.upper()
+                try:
+                    df_rev_est['earnings_date'] = pd.to_datetime(df_rev_est['earnings_date'], errors='coerce')
+                except Exception:
+                    pass
+                if not base.empty and 'ticker' in base.columns and 'earnings_date' in base.columns:
+                    base = pd.merge(base, df_rev_est[['ticker','earnings_date','estimate_revenue']], on=['ticker','earnings_date'], how='left')
+            except Exception as e:
+                print(f"[DB] Failed to attach revenue estimates to earnings_history: {e}")
+
+        if not base.empty:
+            # Do not recompute EPS surprise if column already exists per schema
+            if 'surprise_percentage' not in base.columns:
+                try:
+                    est = pd.to_numeric(base.get('estimate_eps'), errors='coerce')
+                    act = pd.to_numeric(base.get('reported_eps'), errors='coerce')
+                    base['surprise_percentage'] = ((act - est) / est.abs() * 100.0).where(est.notna() & (est != 0))
+                except Exception:
+                    pass
+            # Keep all available columns post-merge, with standardized keys present
+            out_hist = base.copy()
+            if {'ticker','earnings_date'}.issubset(out_hist.columns):
+                out_hist = out_hist.sort_values(['ticker','earnings_date'])
+            # Write to both canonical and input paths
+            try:
+                os.makedirs('data', exist_ok=True)
+                out_hist.to_csv('data/earnings_history.csv', index=False)
+                print(f"[DB] Wrote data/earnings_history.csv (rows={len(out_hist)})")
+            except Exception as e:
+                print(f"[DB] Failed to write data/earnings_history.csv: {e}")
+            try:
+                out_hist.to_csv(os.path.join(output_dir, 'earnings_history.csv'), index=False)
+                print(f"[DB] Wrote {os.path.join(output_dir, 'earnings_history.csv')} (rows={len(out_hist)})")
+                out_paths['earnings_history'] = os.path.join(output_dir, 'earnings_history.csv')
+            except Exception as e:
+                print(f"[DB] Failed to write {os.path.join(output_dir, 'earnings_history.csv')}: {e}")
+        else:
+            print("[DB] earnings_history not built (no earnings/estimates data).")
+    except Exception as e:
+        print(f"[DB] Failed to build earnings_history: {e}")
 
     return out_paths
 

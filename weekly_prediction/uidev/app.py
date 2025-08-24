@@ -31,6 +31,17 @@ import joblib
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
+# Robust import for data loader whether run as module or script
+try:
+    from uidev.data_loader import load_ui_unified  # type: ignore
+except Exception:
+    try:
+        import sys as _sys, os as _os
+        _sys.path.append(_os.path.dirname(__file__))
+        from data_loader import load_ui_unified  # type: ignore
+    except Exception:
+        def load_ui_unified():
+            return None
 
 # Load environment variables from .env file
 load_dotenv()
@@ -449,10 +460,33 @@ if not st.session_state.top_stocks_df.empty:
     except Exception:
         pass
     with col2:
-        # Current price (robust parsing)
+        # Current price: prefer unified/features close for this ticker; fallback to parsed string
         try:
             import re
-            cval = float(re.sub(r'[^0-9.+-]','', str(best_stock.get('close',''))))
+            cval = None
+            # 1) From current row if present
+            for cc in ['close', 'close_ens']:
+                if cc in best_stock.index and pd.notna(best_stock.get(cc)):
+                    try:
+                        cval = float(re.sub(r'[^0-9.+-]','', str(best_stock.get(cc))))
+                        break
+                    except Exception:
+                        continue
+            # 2) From unified dataset by ticker
+            if cval is None:
+                try:
+                    dfu = load_ui_unified()
+                    if dfu is not None and not dfu.empty and 'ticker' in dfu.columns:
+                        dfu['ticker'] = dfu['ticker'].astype(str).str.upper()
+                        _tkr = str(best_stock.get('ticker', '')).upper()
+                        _rowu = dfu[dfu['ticker'] == _tkr]
+                        if not _rowu.empty and 'close' in _rowu.columns:
+                            cval = float(re.sub(r'[^0-9.+-]','', str(_rowu.iloc[0].get('close'))))
+                except Exception:
+                    pass
+            # 3) Fallback to parsed string in current row
+            if cval is None:
+                cval = float(re.sub(r'[^0-9.+-]','', str(best_stock.get('close',''))))
             st.metric("Current Price", f"${cval:.2f}")
         except Exception:
             st.metric("Current Price", str(best_stock.get('close','n/a')))
@@ -460,20 +494,39 @@ if not st.session_state.top_stocks_df.empty:
         # Predicted change: compute if not present
         try:
             import re, math
-            if 'predicted_change' in best_stock.index:
+            if 'predicted_change' in best_stock.index and pd.notna(best_stock.get('predicted_change')):
                 pc = float(re.sub(r'[^0-9.+-]','', str(best_stock.get('predicted_change',''))))
             else:
                 # derive from predicted return pct and close
                 pr_num = None
-                for c in ['predicted_return_pct','xgb_predicted_return_pct','lstm_predicted_return_pct','lstm_pred']:
-                    if c in best_stock.index:
+                for c in ['predicted_return_pct','ensemble_score','xgb_predicted_return_pct','lstm_predicted_return_pct','xgb_pred','lstm_pred']:
+                    if c in best_stock.index and pd.notna(best_stock.get(c)):
                         try:
                             pr_num = float(re.sub(r'[^0-9.+-]','', str(best_stock.get(c,''))))
                             break
                         except Exception:
                             continue
-                cnum = float(re.sub(r'[^0-9.+-]','', str(best_stock.get('close','')))) if 'close' in best_stock.index else float('nan')
-                pc = (pr_num / 100.0) * cnum if pr_num is not None and math.isfinite(cnum) else float('nan')
+                # close selection
+                cnum = None
+                for cc in ['close','close_ens']:
+                    if cc in best_stock.index and pd.notna(best_stock.get(cc)):
+                        try:
+                            cnum = float(re.sub(r'[^0-9.+-]','', str(best_stock.get(cc,''))))
+                            break
+                        except Exception:
+                            continue
+                if cnum is None:
+                    try:
+                        dfu = load_ui_unified()
+                        if dfu is not None and not dfu.empty and 'ticker' in dfu.columns:
+                            dfu['ticker'] = dfu['ticker'].astype(str).str.upper()
+                            _tkr = str(best_stock.get('ticker', '')).upper()
+                            _rowu = dfu[dfu['ticker'] == _tkr]
+                            if not _rowu.empty and 'close' in _rowu.columns:
+                                cnum = float(re.sub(r'[^0-9.+-]','', str(_rowu.iloc[0].get('close'))))
+                    except Exception:
+                        pass
+                pc = (pr_num / 100.0) * cnum if (pr_num is not None and cnum is not None and math.isfinite(cnum)) else float('nan')
             st.metric("Predicted Change", f"${pc:+.2f}" if pc == pc else "n/a")
         except Exception:
             st.metric("Predicted Change", "n/a")
@@ -588,41 +641,67 @@ if not st.session_state.top_stocks_df.empty:
         if selected_ticker:
             # Load complete featured data to get all technical indicators
             try:
-                # Prefer full technical features if available, then model outputs, then legacy featured
+                # First, prefer unified UI dataset if present
+                df_unified = load_ui_unified()
+                used_unified = False
+                if df_unified is not None and not df_unified.empty:
+                    if 'ticker' in df_unified.columns:
+                        df_unified['ticker'] = df_unified['ticker'].astype(str).str.upper()
+                    _rowu = df_unified[df_unified['ticker'] == selected_ticker]
+                    if not _rowu.empty:
+                        stock_featured_data = _rowu.iloc[0]
+                        used_unified = True
+
+                # Prefer full technical features if available (env overrides first), then model outputs, then legacy featured
                 step_ctx = "load_weekly_output"
-                candidates = [
-                    os.path.join(PRJ_DIR, 'data', 'features', 'stock_features_clean.csv'),
-                    os.path.join(PRJ_DIR, 'data', 'xgboost', 'xgboost_weekly_output.csv'),
-                    os.path.join(PRJ_DIR, 'data', 'ensemble', 'ensemble_weekly_output.csv'),
-                ]
-                env_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
-                legacy = [env_path, 'data/top/featured_stocks_top.csv', 'data/featured_stocks_top.csv']
-                candidates += [p if os.path.isabs(p) else os.path.join(PRJ_DIR, p) for p in legacy]
-                picked = None
-                for _p in candidates:
-                    if os.path.exists(_p):
-                        picked = _p
-                        break
-                if picked is None:
-                    raise FileNotFoundError("No featured/feature dataset found for technicals")
-                complete_featured_data = pd.read_csv(picked)
-                step_ctx = "normalize_featured_cols"
-                if 'ticker' in complete_featured_data.columns:
-                    complete_featured_data['ticker'] = complete_featured_data['ticker'].astype(str).str.upper()
-                # Coerce common numeric fields to numeric to avoid f-string format errors downstream
-                try:
-                    _num_cols = [
-                        'close','open','high','low','volume',
-                        'support_20d','resistance_20d','rsi_14d',
-                        'momentum_5d','momentum_10d','momentum_20d','momentum_30d','momentum_60d',
-                        'predicted_return_pct','confidence_score','risk_score','composite_score'
+                if not used_unified:
+                    candidates = []
+                    env_features = os.getenv('PATH_FEATURES_CLEAN')
+                    if env_features:
+                        candidates.append(env_features if os.path.isabs(env_features) else os.path.join(PRJ_DIR, env_features))
+                    candidates += [
+                        os.path.join(PRJ_DIR, 'data', 'features', 'stock_features_clean.csv'),
+                        os.path.join(PRJ_DIR, 'data', 'xgboost', 'xgboost_weekly_output.csv'),
+                        os.path.join(PRJ_DIR, 'data', 'ensemble', 'ensemble_weekly_output.csv'),
                     ]
-                    for _c in _num_cols:
-                        if _c in complete_featured_data.columns:
-                            complete_featured_data[_c] = pd.to_numeric(complete_featured_data[_c], errors='coerce')
-                except Exception:
-                    pass
-                stock_featured_data = complete_featured_data[complete_featured_data['ticker'] == selected_ticker].iloc[0]
+                    env_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
+                    legacy = [env_path, 'data/top/featured_stocks_top.csv', 'data/featured_stocks_top.csv']
+                    candidates += [p if os.path.isabs(p) else os.path.join(PRJ_DIR, p) for p in legacy]
+                    picked = None
+                    for _p in candidates:
+                        if os.path.exists(_p):
+                            picked = _p
+                            break
+                    if picked is None:
+                        raise FileNotFoundError("No featured/feature dataset found for technicals")
+                    complete_featured_data = pd.read_csv(picked)
+                    step_ctx = "normalize_featured_cols"
+                    if 'ticker' in complete_featured_data.columns:
+                        complete_featured_data['ticker'] = complete_featured_data['ticker'].astype(str).str.upper()
+                    # Coerce common numeric fields to numeric to avoid f-string format errors downstream
+                    try:
+                        _num_cols = [
+                            'close','open','high','low','volume',
+                            'support_20d','resistance_20d','rsi_14d',
+                            'momentum_5d','momentum_10d','momentum_20d','momentum_30d','momentum_60d',
+                            'predicted_return_pct','confidence_score','risk_score','composite_score'
+                        ]
+                        for _c in _num_cols:
+                            if _c in complete_featured_data.columns:
+                                complete_featured_data[_c] = pd.to_numeric(complete_featured_data[_c], errors='coerce')
+                    except Exception:
+                        pass
+                    rows_for_ticker = complete_featured_data[complete_featured_data['ticker'] == selected_ticker]
+                    if rows_for_ticker.empty:
+                        # Build a minimal featured row from latest prices for this ticker to enable backfill
+                        _td_min = stock_data[stock_data['ticker'] == selected_ticker].copy()
+                        if _td_min.empty:
+                            raise ValueError(f"No data for ticker {selected_ticker} in picked features/prices source: {picked}")
+                        _td_min['date'] = pd.to_datetime(_td_min['date'], errors='coerce')
+                        _td_min = _td_min.sort_values('date').tail(1)
+                        stock_featured_data = _td_min.iloc[0]
+                    else:
+                        stock_featured_data = rows_for_ticker.iloc[0]
                 # Backfill support/resistance if missing from weekly output
                 step_ctx = "backfill_support_resistance"
                 try:
@@ -652,24 +731,43 @@ if not st.session_state.top_stocks_df.empty:
                         ]
                         if still_missing:
                             try:
+                                # Prefer recent closes from stock_data; fallback to features_clean if needed
                                 _td = stock_data[stock_data['ticker'] == selected_ticker].copy()
-                                _td['date'] = pd.to_datetime(_td['date'], errors='coerce')
-                                _td = _td.sort_values('date').tail(20)
-                                if len(_td) > 0:
-                                    if 'support_20d' in still_missing:
-                                        stock_featured_data['support_20d'] = float(_td['close'].min())
-                                    if 'resistance_20d' in still_missing:
-                                        stock_featured_data['resistance_20d'] = float(_td['close'].max())
+                                if _td.empty:
+                                    try:
+                                        _feats_p = os.getenv('PATH_FEATURES_CLEAN', 'data/features/stock_features_clean.csv')
+                                        _feats = pd.read_csv(_feats_p)
+                                        _feats = _feats[_feats['ticker'].astype(str).str.upper() == selected_ticker]
+                                        _td = _feats[['date','close']].copy()
+                                    except Exception:
+                                        _td = pd.DataFrame()
+                                if not _td.empty:
+                                    _td['date'] = pd.to_datetime(_td['date'], errors='coerce')
+                                    _td = _td.sort_values('date').tail(20)
+                                if len(_td) >= 5:
+                                    _min_close = float(pd.to_numeric(_td['close'], errors='coerce').min())
+                                    _max_close = float(pd.to_numeric(_td['close'], errors='coerce').max())
+                                    if 'support_20d' in still_missing and np.isfinite(_min_close) and _min_close > 0:
+                                        stock_featured_data['support_20d'] = _min_close
+                                    if 'resistance_20d' in still_missing and np.isfinite(_max_close) and _max_close > 0:
+                                        stock_featured_data['resistance_20d'] = _max_close
                             except Exception:
                                 pass
                 except Exception:
                     pass
                 
-                # Backfill RSI and momentum from price history if missing
+                # Backfill RSI and momentum from price history if missing or zeroed
                 try:
                     need_ta = []
                     for _c in ['rsi_14d', 'momentum_5d', 'momentum_10d']:
-                        if _c not in stock_featured_data.index or pd.isna(stock_featured_data.get(_c)):
+                        _val = stock_featured_data.get(_c)
+                        _is_missing = (_c not in stock_featured_data.index) or pd.isna(_val)
+                        # Treat exact zero as missing to avoid stale/default zeros
+                        try:
+                            _is_zero = float(str(_val).replace('%','')) == 0.0
+                        except Exception:
+                            _is_zero = False
+                        if _is_missing or _is_zero:
                             need_ta.append(_c)
                     if need_ta:
                         _td2 = stock_data[stock_data['ticker'] == selected_ticker].copy()
@@ -764,9 +862,9 @@ if not st.session_state.top_stocks_df.empty:
                         _res = _num(stock_featured_data.get('resistance_20d'))
                         _sup = _num(stock_featured_data.get('support_20d'))
                         st.metric("Current Price", f"${_cp:.2f}" if _cp == _cp else str(stock_featured_data.get('close','N/A')))
-                        if not pd.isna(_res):
+                        if not pd.isna(_res) and _res > 0:
                             st.metric("Resistance Level", f"${_res:.2f}")
-                        if not pd.isna(_sup):
+                        if not pd.isna(_sup) and _sup > 0:
                             st.metric("Support Level", f"${_sup:.2f}")
                     
                     with col2:
@@ -783,7 +881,10 @@ if not st.session_state.top_stocks_df.empty:
                         st.metric("Momentum (10d)", momentum_10d_display)
                     
                     with col3:
-                        resistance_status = "🟢 BROKEN" if stock_featured_data.get('broke_resistance', False) else "🔴 HOLDING"
+                        _res = _num(stock_featured_data.get('resistance_20d'))
+                        _cp = _num(stock_featured_data.get('close'))
+                        runtime_broken = (isinstance(_cp, float) and isinstance(_res, float) and _res == _res and _cp == _cp and _res > 0 and _cp >= _res)
+                        resistance_status = "🟢 BROKEN" if (stock_featured_data.get('broke_resistance', False) or runtime_broken) else "🔴 HOLDING"
                         st.metric("Resistance Status", resistance_status)
                         # Predicted Return
                         _pr = stock_featured_data.get('predicted_return_pct')
@@ -821,14 +922,22 @@ if not st.session_state.top_stocks_df.empty:
                         else:
                             resistance_level = _num(stock_featured_data.get('resistance_20d'))
                             current_price = _num(stock_featured_data.get('close'))
-                            if resistance_level == resistance_level:
+                            if resistance_level == resistance_level and resistance_level > 0 and current_price == current_price:
                                 distance_to_resistance = resistance_level - current_price
-                                st.metric(
-                                    "🔴 Resistance Level", 
-                                    f"${resistance_level:.2f}",
-                                    delta=f"${distance_to_resistance:.2f} to break"
-                                )
-                                st.info(f"**Resistance Level**: ${resistance_level:.2f}. Current price ${current_price:.2f} needs to rise ${distance_to_resistance:.2f} to break resistance.")
+                                if distance_to_resistance > 0:
+                                    st.metric(
+                                        "🔴 Resistance Level", 
+                                        f"${resistance_level:.2f}",
+                                        delta=f"${distance_to_resistance:.2f} to break"
+                                    )
+                                    st.info(f"**Resistance Level**: ${resistance_level:.2f}. Current price ${current_price:.2f} needs to rise ${distance_to_resistance:.2f} to break resistance.")
+                                else:
+                                    st.metric(
+                                        "🟢 Above Resistance", 
+                                        f"${resistance_level:.2f}",
+                                        delta=f"+${abs(distance_to_resistance):.2f} above resistance"
+                                    )
+                                    st.info(f"Current price ${current_price:.2f} is already ${abs(distance_to_resistance):.2f} above resistance level ${resistance_level:.2f}.")
                             else:
                                 st.metric("🔴 Resistance Break Price", "Not broken yet")
                         
@@ -879,7 +988,7 @@ if not st.session_state.top_stocks_df.empty:
                     
                     resistance_level = _num(stock_featured_data.get('resistance_20d'))
                     current_price = _num(stock_featured_data.get('close'))
-                    broke_resistance = stock_featured_data.get('broke_resistance', False)
+                    broke_resistance = stock_featured_data.get('broke_resistance', False) or (resistance_level == resistance_level and current_price == current_price and resistance_level > 0 and current_price >= resistance_level)
                     
                     if resistance_level == resistance_level:
                         col1, col2 = st.columns(2)
@@ -1251,8 +1360,52 @@ if not st.session_state.top_stocks_df.empty:
                 
                 # Load earnings history data
                 try:
-                    earnings_history_path = os.getenv('EARNINGS_HISTORY_CSV', 'data/earnings_history.csv')
+                    # Ensure env from config is applied (so EARNINGS_HISTORY_CSV is set when APP_CONFIG is provided)
+                    try:
+                        from utils.config import load_config, apply_env_from_config
+                        cfg = load_config(os.getenv('APP_CONFIG', 'config.yaml'))
+                        apply_env_from_config(cfg)
+                    except Exception:
+                        pass
+                    # Resolve path from env or common defaults
+                    import os as _os
+                    from pathlib import Path as _Path
+                    base_dir = _Path(__file__).resolve().parents[1]
+                    candidates = []
+                    p_env = _os.getenv('EARNINGS_HISTORY_CSV')
+                    if p_env:
+                        candidates.append(p_env)
+                    candidates += ['data/input/earnings_history.csv', 'data/earnings_history.csv']
+                    # Resolve relative paths against project root to avoid CWD issues under Streamlit
+                    cand_abs = [p if _os.path.isabs(p) else str(base_dir / p) for p in candidates]
+                    earnings_history_path = next((p for p in cand_abs if p and _os.path.isfile(p)), None)
+                    if not earnings_history_path:
+                        raise FileNotFoundError(f"earnings_history.csv not found in any of: {', '.join(candidates)} (resolved: {', '.join(cand_abs)})")
                     earnings_data = pd.read_csv(earnings_history_path)
+                    # Normalize earnings columns to handle schema/alias variations
+                    _lower_map = {c.lower().strip(): c for c in earnings_data.columns}
+                    _rename = {}
+                    # Map common aliases to canonical
+                    alias_map = {
+                        'ticker': 'ticker',
+                        'symbol': 'ticker',
+                        'earnings_date': 'earnings_date',
+                        'date': 'earnings_date',
+                        'reported_eps': 'reported_eps',
+                        'actualeps': 'reported_eps',
+                        'eps': 'reported_eps',
+                        'estimate_eps': 'estimate_eps',
+                        'epsestimate': 'estimate_eps',
+                        'estimate': 'estimate_eps',
+                        'surprise_percentage': 'surprise_percentage',
+                        'surprise_percent': 'surprise_percentage',
+                        'surprise_pct': 'surprise_percentage',
+                    }
+                    for src, dst in alias_map.items():
+                        if src in _lower_map and _lower_map[src] != dst and dst not in _lower_map:
+                            _rename[_lower_map[src]] = dst
+                    if _rename:
+                        earnings_data = earnings_data.rename(columns=_rename)
                     earnings_ticker_data = earnings_data[earnings_data['ticker'] == selected_ticker]
                     
                     if not earnings_ticker_data.empty:
@@ -1268,9 +1421,12 @@ if not st.session_state.top_stocks_df.empty:
                         # Format the data for display
                         display_data = earnings_ticker_data.copy()
                         display_data['earnings_date'] = display_data['earnings_date'].dt.strftime('%Y-%m-%d')
-                        display_data['reported_eps'] = display_data['reported_eps'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
-                        display_data['estimate_eps'] = display_data['estimate_eps'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
-                        display_data['surprise_percentage'] = display_data['surprise_percentage'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A")
+                        if 'reported_eps' in display_data.columns:
+                            display_data['reported_eps'] = display_data['reported_eps'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
+                        if 'estimate_eps' in display_data.columns:
+                            display_data['estimate_eps'] = display_data['estimate_eps'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
+                        if 'surprise_percentage' in display_data.columns:
+                            display_data['surprise_percentage'] = display_data['surprise_percentage'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A")
                         
                         st.dataframe(display_data, use_container_width=True, hide_index=True)
                         
@@ -1278,7 +1434,7 @@ if not st.session_state.top_stocks_df.empty:
                         st.subheader("📈 Earnings Surprise Trend")
                         
                         # Filter out rows with missing data
-                        chart_data = earnings_ticker_data.dropna(subset=['surprise_percentage'])
+                        chart_data = earnings_ticker_data.dropna(subset=['surprise_percentage']) if 'surprise_percentage' in earnings_ticker_data.columns else earnings_ticker_data.head(0)
                         
                         if not chart_data.empty:
                             fig = go.Figure()
@@ -1371,7 +1527,7 @@ if not st.session_state.top_stocks_df.empty:
                 
                 resistance_level = _num(stock_featured_data.get('resistance_20d'))
                 current_price = _num(stock_featured_data.get('close'))
-                broke_resistance = stock_featured_data.get('broke_resistance', False)
+                broke_resistance = stock_featured_data.get('broke_resistance', False) or (resistance_level == resistance_level and current_price == current_price and resistance_level > 0 and current_price >= resistance_level)
                 
                 if resistance_level == resistance_level:
                     col1, col2 = st.columns(2)

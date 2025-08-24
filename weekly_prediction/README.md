@@ -232,6 +232,8 @@ python run_pipeline.py --skip_fetch --skip_features --skip_xgb --skip_lstm
 
 python utils/lstm_diagnostics.py --features data/features/stock_features_clean.csv --out data/lstm/diagnostics_report.json
 
+cd /Users/gaurav/workspace/datascience/ds_uiv2/datascience_learning/weekly_prediction && APP_CONFIG=config.yaml conda run -n stocks3 python utils/ui_diagnose.py --ticker RGTI | cat
+
 no, I want refactor the code . so it run in steps. 
 It helps me understand what is not working well
 in the run_pipeline_v2.py
