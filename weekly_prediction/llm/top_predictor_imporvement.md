@@ -101,3 +101,5 @@ If you want, I can add a small “Explain prediction” panel to show for any ti
 - `momentum_pos_count`, `signal_pos_count`
 - key features and top contributing feature (SHAP)
 
+now create the utlity called feature_enginreeing.py which generates features for 2 files 
+

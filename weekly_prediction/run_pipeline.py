@@ -1,231 +1,129 @@
-from data_loader import load_all_data
-from feature_engineering import create_all_features
-from datetime import date, datetime
 import argparse
+import time
+import logging
+from utils.logging_utils import configure_logging
+from utils.config import load_config, apply_env_from_config
 import os
-import pandas as pd
-import numpy as np
 
+from utils.db_fetch import fetch_all as db_fetch_all
+from utils.feature_engineering import build_features_for_inputs
+from utils.train_xgboost_weekly import train_and_export as run_xgb_weekly
+from utils.train_lstm_weekly import train_and_export as run_lstm_weekly
+from utils.run_ensemble_weekly import run_ensemble as run_ensemble_weekly
 
-def _score_change(pct: float) -> int:
-    """Map percent change to a discrete score per features_top_momentum.md example."""
-    try:
-        v = float(pct)
-    except Exception:
-        return 0
-    if v > 10.0:
-        return 3
-    if v > 5.0:
-        return 2
-    if v > 0.0:
-        return 1
-    return 0
-
-
-def _compute_window_scores(latest_slice: pd.DataFrame, horizons: list[int]) -> tuple[int, dict]:
-    """Compute aggregated price+volume scores for the provided horizons using the latest slice for a ticker.
-
-    latest_slice must be sorted by date ascending and contain at least max(horizons)+1 rows.
-    Returns (total_score, breakdown_dict).
-    """
-    total = 0
-    breakdown: dict[str, float] = {}
-    if latest_slice.empty:
-        return 0, breakdown
-    # Ensure we have numeric close/volume
-    s_close = pd.to_numeric(latest_slice['close'], errors='coerce')
-    s_vol = pd.to_numeric(latest_slice['volume'], errors='coerce')
-    n = len(latest_slice)
-    for h in horizons:
-        if n <= h:
-            # Not enough history for this horizon
-            continue
-        start_price = s_close.iloc[-h-1]
-        end_price = s_close.iloc[-1]
-        start_vol = s_vol.iloc[-h-1]
-        end_vol = s_vol.iloc[-1]
-        if pd.notna(start_price) and start_price != 0:
-            price_pct = (end_price - start_price) / start_price * 100.0
-        else:
-            price_pct = np.nan
-        if pd.notna(start_vol) and start_vol != 0:
-            vol_pct = (end_vol - start_vol) / start_vol * 100.0
-        else:
-            vol_pct = np.nan
-        breakdown[f'price_change_{h}d_pct'] = float(price_pct) if np.isfinite(price_pct) else np.nan
-        breakdown[f'volume_change_{h}d_pct'] = float(vol_pct) if np.isfinite(vol_pct) else np.nan
-        total += _score_change(price_pct) + _score_change(vol_pct)
-    return total, breakdown
-
-
-def _export_momentum_top_lists_from_prices(prices_df: pd.DataFrame, output_dir: str = 'data/momentum', top_n: int = 25) -> None:
-    """Create top performers lists for 5d/15d/30d momentum and write CSV files.
-
-    Produces:
-      - data/momentum/top5d_performers.csv
-      - data/momentum/top15d_performers.csv
-      - data/momentum/top30d_performers.csv
-    """
-    if prices_df is None or prices_df.empty:
-        raise ValueError('prices_df is empty; cannot compute momentum lists')
-
-    # Ensure proper dtypes
-    df = prices_df.copy()
-    if 'date' not in df.columns or 'ticker' not in df.columns or 'close' not in df.columns or 'volume' not in df.columns:
-        raise ValueError("prices_df must contain columns: 'date','ticker','close','volume'")
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df = df.dropna(subset=['date', 'ticker', 'close', 'volume'])
-    df = df.sort_values(['ticker', 'date'])
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Define horizon sets for scoring per output window
-    config = {
-        5: [1, 3, 5],
-        15: [1, 3, 5, 10, 15],
-        30: [1, 3, 5, 10, 15, 20, 30],
-    }
-
-    latest_date = df['date'].max()
-
-    results: dict[int, list[dict]] = {5: [], 15: [], 30: []}
-    for ticker, g in df.groupby('ticker'):
-        g_sorted = g.sort_values('date')
-        # For realized returns we need start/end prices for each window
-        for window_days, horizons in config.items():
-            if len(g_sorted) <= window_days:
-                continue
-            # Compute scores using multiple horizons
-            score, breakdown = _compute_window_scores(g_sorted, horizons)
-
-            # Realized return for this window
-            end_row = g_sorted.iloc[-1]
-            end_price = float(end_row['close'])
-            end_date = pd.to_datetime(end_row['date'])
-            start_row = g_sorted.iloc[-window_days-1]
-            start_price = float(start_row['close'])
-            start_date = pd.to_datetime(start_row['date'])
-            if start_price == 0 or not np.isfinite(start_price):
-                realized_return_pct = np.nan
-            else:
-                realized_return_pct = (end_price - start_price) / start_price * 100.0
-
-            row = {
-                'ticker': str(ticker),
-                'start_date': start_date.date(),
-                'end_date': end_date.date(),
-                'start_price': start_price,
-                'end_price': end_price,
-                'realized_return_pct': realized_return_pct,
-                'momentum_score': int(score),
-            }
-            # Add a few diagnostic fields: primary window price/volume change
-            try:
-                from_idx = -window_days-1
-                to_idx = -1
-                p0 = float(g_sorted['close'].iloc[from_idx])
-                p1 = float(g_sorted['close'].iloc[to_idx])
-                v0 = float(g_sorted['volume'].iloc[from_idx])
-                v1 = float(g_sorted['volume'].iloc[to_idx])
-                row[f'price_change_{window_days}d_pct'] = (p1 - p0) / p0 * 100.0 if p0 else np.nan
-                row[f'volume_change_{window_days}d_pct'] = (v1 - v0) / v0 * 100.0 if v0 else np.nan
-            except Exception:
-                row[f'price_change_{window_days}d_pct'] = np.nan
-                row[f'volume_change_{window_days}d_pct'] = np.nan
-
-            # Optionally include horizon breakdown for debugging
-            for k, v in breakdown.items():
-                # Only include the per-window that matches output window or keep all; keep all for transparency
-                row[k] = v
-
-            results[window_days].append(row)
-
-    # Build DataFrames, rank, and save top-N
-    for window_days, rows in results.items():
-        if not rows:
-            continue
-        out_df = pd.DataFrame(rows)
-        out_df = out_df.replace([np.inf, -np.inf], np.nan)
-        out_df = out_df.sort_values(['momentum_score', f'price_change_{window_days}d_pct'], ascending=[False, False])
-        out_top = out_df.head(int(top_n))
-        out_path = os.path.join(output_dir, f'top{window_days}d_performers.csv')
-        out_top.to_csv(out_path, index=False)
-        print(f"Saved momentum top-{top_n} for {window_days}d window to: {out_path} (rows={len(out_top)})")
 
 def main():
-    """
-    This script runs the entire data processing and model training pipeline.
-    """
-    print("Starting the data pipeline...")
-    
-    parser = argparse.ArgumentParser(description="Run data processing and model training pipeline")
-    parser.add_argument("--date", type=str, default=None, help="Date in YYYY-MM-DD format. If omitted, use undated files.")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Weekly prediction pipeline with optional DB fetch, features, XGB, LSTM and Ensemble steps")
+    parser.add_argument("--skip_fetch", action="store_true", help="Skip fetching data from the database")
+    parser.add_argument("--fetch_start", default=None, help="Optional fetch start date (YYYY-MM-DD)")
+    parser.add_argument("--fetch_end", default=None, help="Optional fetch end date (YYYY-MM-DD)")
+    parser.add_argument("--skip_features", action="store_true", help="Skip feature engineering step")
+    parser.add_argument("--clean_prices", default=os.getenv('PATH_CLEAN_PRICES', "data/input/stock_prices_with_clean_data.csv"), help="Path to clean prices CSV")
+    parser.add_argument("--unclean_prices", default=os.getenv('PATH_UNCLEAN_PRICES', "data/input/stock_prices_with_unclean_data.csv"), help="Path to unclean prices CSV")
+    parser.add_argument("--features_out", default=os.getenv('PATH_FEATURES_DIR', "data/features"), help="Directory to write engineered features")
+    # XGBoost step
+    parser.add_argument("--skip_xgb", action="store_true", help="Skip XGBoost weekly training/export")
+    parser.add_argument("--xgb_features", default=None, help="Path to features CSV for XGB (defaults to features_out/stock_features_clean.csv)")
+    parser.add_argument("--xgb_out", default=os.getenv('PATH_XGB_OUT', "data/xgboost/xgboost_weekly_output.csv"), help="Output CSV for XGB weekly scores")
+    parser.add_argument("--xgb_horizon", type=int, default=5, help="Forward return horizon for XGB")
+    # LSTM step
+    parser.add_argument("--skip_lstm", action="store_true", help="Skip LSTM weekly training/export")
+    parser.add_argument("--lstm_features", default=None, help="Path to features CSV for LSTM (defaults to features_out/stock_features_clean.csv)")
+    parser.add_argument("--lstm_out", default=os.getenv('PATH_LSTM_OUT', "data/lstm/lstm_weekly_output.csv"), help="Output CSV for LSTM weekly predictions")
+    parser.add_argument("--lstm_lookback", type=int, default=None, help="Sequence length (override model default)")
+    parser.add_argument("--lstm_horizon", type=int, default=None, help="Forward return horizon (override model default)")
+    parser.add_argument("--lstm_skip_train", action="store_true", help="Skip LSTM training and use existing saved model/meta")
+    parser.add_argument("--lstm_model", default=None, help="Path to saved LSTM model (.keras) if skipping training")
+    parser.add_argument("--lstm_meta", default=None, help="Path to LSTM meta JSON if skipping training")
+    # Ensemble step
+    parser.add_argument("--skip_ensemble", action="store_true", help="Skip ensemble blend step")
+    parser.add_argument("--ensemble_method", choices=["weighted","rank","voting","prob"], default=os.getenv('ENSEMBLE_METHOD','weighted'), help="Blending method")
+    parser.add_argument("--ensemble_alpha", type=float, default=float(os.getenv('ENSEMBLE_ALPHA','0.6')), help="Weight on XGB component (0..1)")
+    parser.add_argument("--ensemble_stack_model", default=os.getenv('ENSEMBLE_STACK_MODEL'), help="Optional path to joblib stacker model")
+    parser.add_argument("--ensemble_out", default=os.getenv('PATH_ENSEMBLE_OUT', "data/ensemble/ensemble_weekly_output.csv"), help="Output CSV for ensemble weekly scores")
+    args, unknown = parser.parse_known_args()
 
-    TARGET_DATE = None
-    if args.date:
+    # Load config file if provided via env or default path
+    cfg_path = os.getenv('APP_CONFIG', 'config.yaml')
+    cfg = load_config(cfg_path)
+    apply_env_from_config(cfg)
+    configure_logging()
+    log = logging.getLogger('pipeline')
+    log.info("[PIPE] Starting pipeline...")
+    t0 = time.perf_counter()
+
+    # Step 0: Fetch datasets from DB (optional)
+    if not args.skip_fetch:
         try:
-            TARGET_DATE = datetime.strptime(args.date, "%Y-%m-%d").date()
-        except ValueError:
-            print(f"Invalid --date value '{args.date}'. Expected format YYYY-MM-DD. Falling back to undated files.")
-            TARGET_DATE = None
-    FEATURE_FILE_PATH_TOP = 'data/featured_stocks_top.csv'
-    FEATURE_FILE_PATH_MOM = 'data/momentum/featured_stocks_momentum.csv'
+            log.info("[PIPE] Fetching datasets from database...")
+            db_fetch_all(output_dir='data/input', start_date=args.fetch_start, end_date=args.fetch_end)
+        except Exception as e:
+            log.warning(f"[PIPE DIAG] DB fetch failed (continuing with existing CSVs): {e}")
 
-    # Step 1: Load the data
-    master_df, prices_df = load_all_data(file_date=TARGET_DATE)
-    if master_df.empty or prices_df.empty:
-        print("Pipeline stopped due to data loading errors.")
-        return
-
-    # Step 2: Engineer all features
-    print("Engineering features...")
-    # Use the provided date for features; if not provided, infer from prices_df
-    features_date = TARGET_DATE
-    if features_date is None:
+    # Step 1: Feature engineering (optional)
+    if not args.skip_features:
         try:
-            latest_prices_date = prices_df['date'].max()
-            if hasattr(latest_prices_date, 'date'):
-                features_date = latest_prices_date.date()
-            else:
-                # In case the column wasn't parsed as datetime for any reason
-                features_date = date.today()
-        except Exception:
-            features_date = date.today()
+            log.info("[PIPE] Building features for clean and unclean price files...")
+            build_features_for_inputs(args.clean_prices, args.unclean_prices, args.features_out)
+        except Exception as e:
+            log.error(f"[PIPE DIAG] Feature engineering failed: {e}")
 
-    featured_stocks_df = create_all_features(master_df, prices_df, today=features_date)
-    # Ensure momentum dir exists
-    os.makedirs(os.path.dirname(FEATURE_FILE_PATH_MOM), exist_ok=True)
-    # Save two separate feature files (initially identical; can diverge later)
-    featured_stocks_df.to_csv(FEATURE_FILE_PATH_TOP, index=False)
-    featured_stocks_df.to_csv(FEATURE_FILE_PATH_MOM, index=False)
-    print(f"Validated features have been saved to: {FEATURE_FILE_PATH_TOP} and {FEATURE_FILE_PATH_MOM}")
+    # Resolve default feature paths for downstream steps
+    features_clean_default = os.path.join(args.features_out, 'stock_features_clean.csv')
+    xgb_features_path = args.xgb_features or features_clean_default
+    lstm_features_path = args.lstm_features or features_clean_default
 
-    # Step 2.5: Generate momentum top performer CSVs per features_top_momentum.md
-    try:
-        _export_momentum_top_lists_from_prices(prices_df, output_dir='data/momentum', top_n=25)
-    except Exception as e:
-        print(f"Failed to create momentum top lists: {e}")
-    
-    #
-    # V V V NEW STEP ADDED V V V
-    #
-    # Step 3: Train separate models (optional)
-    try:
-        # Delay import so that missing ML deps do not break feature generation
-        from prediction_model import train_top_model, train_momentum_model  # noqa: WPS433
-        top_result = train_top_model()
-        print(top_result)
-        mom_result = train_momentum_model()
-        print(mom_result)
-    except ModuleNotFoundError as e:
-        # Gracefully skip training if ML dependencies (e.g., xgboost) are missing
-        print(f"Skipping model training: {e}")
-    except Exception as e:
-        print(f"Training step failed but features were generated successfully: {e}")
-    #
-    # ^ ^ ^ END OF NEW STEP ^ ^ ^
-    #
+    # Step 2: XGBoost weekly (optional)
+    if not args.skip_xgb:
+        try:
+            log.info(f"[PIPE] Running XGB weekly → features={xgb_features_path}")
+            t_xgb = time.perf_counter()
+            run_xgb_weekly(xgb_features_path, args.xgb_out, args.xgb_horizon)
+            log.info(f"[PIPE TIME] XGB weekly: {time.perf_counter() - t_xgb:.2f}s")
+        except Exception as e:
+            log.error(f"[PIPE DIAG] XGB weekly failed: {e}")
+
+    # Step 3: LSTM weekly (optional)
+    if not args.skip_lstm:
+        try:
+            log.info(f"[PIPE] Running LSTM weekly → features={lstm_features_path}")
+            t_lstm = time.perf_counter()
+            run_lstm_weekly(
+                features_path=lstm_features_path,
+                out_path=args.lstm_out,
+                lookback=args.lstm_lookback,
+                horizon=args.lstm_horizon,
+                skip_train=bool(args.lstm_skip_train),
+                model_path=args.lstm_model,
+                meta_path=args.lstm_meta,
+            )
+            log.info(f"[PIPE TIME] LSTM weekly: {time.perf_counter() - t_lstm:.2f}s")
+        except Exception as e:
+            log.error(f"[PIPE DIAG] LSTM weekly failed: {e}")
+
+    # Step 4: Ensemble weekly (optional)
+    if not args.skip_ensemble:
+        try:
+            log.info("[PIPE] Running Ensemble weekly blend...")
+            t_ens = time.perf_counter()
+            run_ensemble_weekly(
+                xgb_path=args.xgb_out,
+                lstm_path=args.lstm_out,
+                features_path=xgb_features_path,
+                method=str(args.ensemble_method).lower(),
+                alpha=float(args.ensemble_alpha),
+                stack_model=args.ensemble_stack_model,
+                out_path=args.ensemble_out,
+            )
+            log.info(f"[PIPE TIME] Ensemble weekly: {time.perf_counter() - t_ens:.2f}s")
+        except Exception as e:
+            log.error(f"[PIPE DIAG] Ensemble weekly failed: {e}")
+
+    log.info("[PIPE] Completed pipeline steps.")
+    log.info(f"[PIPE TIME] Total elapsed: {time.perf_counter() - t0:.2f}s")
+
 
 if __name__ == "__main__":
     main()
+
+

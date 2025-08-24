@@ -1,0 +1,72 @@
+logging:
+  level: INFO
+  file: logs/app.log
+
+penalty:
+  alpha: 8.0
+  rsi_gamma: 0.35
+  rsi_bonus: 0.10
+  w_min: 0.5
+  w_max: 1.1
+
+ensemble:
+  method: weighted
+  alpha: 0.6
+  top_n: 25
+  stack_model: null
+
+xgboost:
+  k: 20
+  tuner_trials: 0
+  tuner_metric: p_at_k  # or ndcg_at_k, mae
+  objective: auto
+  ndcg_gain: linear  # or exp2
+  importance_type: gain
+  n_estimators: 3000
+  random_state: 42
+  n_jobs: -1
+  selloff_train_weight_factor: 0.70
+  oversold_bounce_weight_factor: 1.20
+
+lstm:
+  model_path: models/lstm/lib/keras/lstm_model.keras
+  meta_path: models/lstm/json/lstm_model_meta.json
+  feature_cols: null  # comma-separated string optional
+  pad_short_seqs: false
+  # training params
+  lookback: 60
+  horizon: 5
+  epochs: 40
+  batch_size: 32
+  validation_split: 0.1
+  early_stopping_patience: 5
+  reduce_lr_patience: 3
+  use_sequence_weights: true
+  use_penalty_weights: true
+  penalty_weight_mode: multiply  # or replace
+  use_curriculum: true
+  curriculum_warmup_epochs: 8
+  bidirectional: false
+
+# To use your trained model/meta at inference time, ensure these paths exist
+# and set APP_CONFIG=config.yaml when running weekly scripts.
+
+features:
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_window: 20
+  bb_k: 2.0
+  fill_slopes_ffill: true
+
+paths:
+  # inputs
+  clean_prices: data/input/stock_prices_with_clean_data.csv
+  unclean_prices: data/input/stock_prices_with_unclean_data.csv
+  features_clean: data/features/stock_features_clean.csv
+  xgb_out: data/xgboost/xgboost_weekly_output.csv
+  lstm_out: data/lstm/lstm_weekly_output.csv
+  ensemble_out: data/ensemble/ensemble_weekly_output.csv
+
+

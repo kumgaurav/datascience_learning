@@ -1,0 +1,31 @@
+name: stocks3
+channels:
+  - apple
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - xgboost
+  - jupyterlab
+  - sqlalchemy
+  - joblib
+  - tensorflow-deps
+  - h5py
+  - protobuf
+  - grpcio
+  - pyyaml
+  - pytest
+  - pip
+  - pip:
+      - tensorflow-macos
+      - tensorflow-metal
+      - seaborn
+      - plotly
+      - psycopg2-binary
+      - PyMySQL
+      - optuna

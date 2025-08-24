@@ -2,9 +2,30 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from stock_selector_v2 import get_top_stocks, get_stock_analysis
-from stock_selector import calculate_confidence_score, calculate_risk_score
-from chatbot import create_chatbot_agent
+
+# Optional legacy model imports (handled independently from chatbot)
+try:
+    from stock_selector_v2 import get_top_stocks, get_stock_analysis  # legacy (optional)
+    from stock_selector import calculate_confidence_score, calculate_risk_score  # legacy (optional)
+except Exception:
+    def get_top_stocks(*args, **kwargs):
+        return pd.DataFrame()
+
+    def get_stock_analysis(*args, **kwargs):
+        return {}
+
+    def calculate_confidence_score(*args, **kwargs):
+        return None
+
+    def calculate_risk_score(*args, **kwargs):
+        return None
+
+# Chatbot import handled separately so it's available even if legacy modules are missing
+try:
+    from chatbot import create_chatbot_agent
+except Exception:
+    def create_chatbot_agent(*args, **kwargs):
+        return None
 import os
 import joblib
 from dotenv import load_dotenv
@@ -13,6 +34,9 @@ import plotly.graph_objects as go
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Project root (one level above uidev/), used for robust relative file resolution
+PRJ_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 
 def create_stock_price_chart(ticker, stock_data, featured_data):
     """
@@ -239,18 +263,93 @@ if 'agent' not in st.session_state:
 col1, col2, col3 = st.columns([1, 2, 1])
 with col2:
     if st.button("🚀 Find Top Stocks for This Week", type="primary", use_container_width=True):
-        with st.spinner("Running advanced analysis... This may take a moment."):
-            st.session_state.top_stocks_df = get_top_stocks(
-                n=num_stocks, 
-                min_confidence=min_confidence, 
-                max_risk=max_risk, 
-                diversify=diversify
-            )
+        with st.spinner("Loading ensemble results..."):
+            # Always load from ensemble_weekly_output.csv for consistency and speed
+            _ens = pd.DataFrame()
+            try:
+                try:
+                    from uidev.data_loader import load_ensemble_weekly, default_sort
+                except ModuleNotFoundError:
+                    import os as _os, sys as _sys
+                    _sys.path.append(_os.path.abspath(_os.path.join(_os.path.dirname(__file__), '..')))
+                    from uidev.data_loader import load_ensemble_weekly, default_sort
+                _ens = load_ensemble_weekly()
+            except Exception:
+                _ens = pd.DataFrame()
+
+            if _ens is not None and not _ens.empty:
+                # Apply confidence filter as ANY-model confidence >= threshold
+                _conf_candidates = [
+                    'xgb_confidence_score', 'lstm_confidence_score',
+                    'confidence_score_xgb', 'confidence_score_lstm', 'confidence_score'
+                ]
+                _present = [c for c in _conf_candidates if c in _ens.columns]
+                if _present:
+                    _conf_any = pd.concat([
+                        pd.to_numeric(_ens[c], errors='coerce').fillna(0) for c in _present
+                    ], axis=1).max(axis=1)
+                    _ens = _ens[_conf_any >= min_confidence]
+                # Sort and clip to desired count
+                try:
+                    _ens = default_sort(_ens)
+                except Exception:
+                    # Basic fallback if sorter fails
+                    _ens = _ens.sort_values(by=[c for c in _ens.columns if c != 'ticker'][0], ascending=False)
+                _ens = _ens.head(num_stocks)
+                # Ensure a unified predicted_return_pct column for downstream charts
+                try:
+                    _dfu = _ens.copy()
+                    # Candidate prediction columns (in preferred order)
+                    _pred_cols = [
+                        'predicted_return_pct',
+                        'xgb_predicted_return_pct', 'lstm_predicted_return_pct',
+                        'xgb_pred', 'lstm_pred'
+                    ]
+                    _present = [c for c in _pred_cols if c in _dfu.columns]
+                    if _present:
+                        import numpy as _np
+                        _vals = []
+                        for c in _present:
+                            _vals.append(pd.to_numeric(_dfu[c], errors='coerce'))
+                        _stack = _np.vstack([s.fillna(_np.nan).to_numpy() for s in _vals])
+                        _pred = _np.nanmean(_stack, axis=0)
+                        # If values look like fractions (< 1 in magnitude), convert to %
+                        with _np.errstate(invalid='ignore'):
+                            _med = _np.nanmedian(_np.abs(_pred))
+                        if _med is not _med or _med <= 1:
+                            _pred = _pred * 100.0
+                        _dfu['predicted_return_pct'] = _pred
+                        _ens = _dfu
+                except Exception:
+                    pass
+                st.session_state.top_stocks_df = _ens.copy()
+                try:
+                    st.caption('Using ensemble_weekly_output.csv')
+                except Exception:
+                    pass
+            else:
+                st.session_state.top_stocks_df = pd.DataFrame()
             
             # Debug information
             st.info(f"📊 Found {len(st.session_state.top_stocks_df)} stocks matching your criteria")
             if not st.session_state.top_stocks_df.empty:
-                st.write(f"Top stock: {st.session_state.top_stocks_df.iloc[0]['ticker']} with {st.session_state.top_stocks_df.iloc[0]['predicted_return_pct']:.2f}% predicted return")
+                # Top stock summary (support multiple prediction columns)
+                _row = st.session_state.top_stocks_df.iloc[0]
+                _pred_cols = ['predicted_return_pct', 'xgb_predicted_return_pct', 'lstm_predicted_return_pct']
+                _pred_val = None
+                for _c in _pred_cols:
+                    if _c in st.session_state.top_stocks_df.columns:
+                        try:
+                            import re
+                            _pred_val = float(re.sub(r"[^0-9.+-]", "", str(_row.get(_c, ''))))
+                            break
+                        except Exception:
+                            continue
+                if _pred_val is None or _pred_val != _pred_val:
+                    _pred_txt = "n/a"
+                else:
+                    _pred_txt = f"{_pred_val:.2f}%"
+                st.write(f"Top stock: {_row.get('ticker','')} with {_pred_txt} predicted return")
             
             # After getting stocks, create the chatbot agent if data is available
             if not st.session_state.top_stocks_df.empty:
@@ -275,27 +374,109 @@ if not st.session_state.top_stocks_df.empty:
     with col1:
         st.metric("Total Stocks", len(st.session_state.top_stocks_df))
     with col2:
-        avg_return = st.session_state.top_stocks_df['predicted_return_pct'].mean()
-        st.metric("Avg Predicted Return", f"{avg_return:.2f}%")
+        # Metrics summary with fallbacks
+        def _series_num(df, cols):
+            import re
+            for c in cols:
+                if c in df.columns:
+                    return pd.to_numeric(df[c].astype(str).str.replace(r'[^0-9.+-]+','', regex=True), errors='coerce')
+            return pd.Series([], dtype=float)
+        avg_return = _series_num(st.session_state.top_stocks_df, ['predicted_return_pct','xgb_predicted_return_pct','lstm_predicted_return_pct','lstm_pred']).mean()
+        st.metric("Avg Predicted Return", f"{0.0 if pd.isna(avg_return) else avg_return:.2f}%")
     with col3:
-        avg_confidence = st.session_state.top_stocks_df['confidence_score'].mean()
-        st.metric("Avg Confidence", f"{avg_confidence:.1f}/100")
+        # Prefer ensemble score
+        ens_series = pd.to_numeric(st.session_state.top_stocks_df.get('ensemble_score'), errors='coerce') if 'ensemble_score' in st.session_state.top_stocks_df.columns else pd.Series([], dtype=float)
+        avg_ens = float(ens_series.mean()) if len(ens_series) else float('nan')
+        st.metric("Avg Ensemble Score", f"{0.0 if pd.isna(avg_ens) else avg_ens:.3f}")
     with col4:
-        avg_risk = st.session_state.top_stocks_df['risk_score'].mean()
-        st.metric("Avg Risk Score", f"{avg_risk:.1f}/100")
+        # Risk fallback
+        risk_cols = [c for c in ['risk_score','lstm_risk_score'] if c in st.session_state.top_stocks_df.columns]
+        if risk_cols:
+            r = pd.to_numeric(st.session_state.top_stocks_df[risk_cols[0]], errors='coerce')
+            avg_risk = float(r.mean())
+        else:
+            avg_risk = float('nan')
+        st.metric("Avg Risk Score", f"{0.0 if pd.isna(avg_risk) else avg_risk:.1f}/100")
     
     # --- Top Pick Highlight ---
     st.header("🏆 Top Pick")
     best_stock = st.session_state.top_stocks_df.iloc[0]
-    
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        st.success(f"**{best_stock['ticker']}** - Predicted Return: **{best_stock['predicted_return_pct']:.2f}%**")
-        st.write(f"Confidence: {best_stock['confidence_score']:.1f}/100 | Risk: {best_stock['risk_score']:.1f}/100")
+    # Safe predicted return text
+    import re
+    def _fmt_ret(val):
+        try:
+            v = float(re.sub(r'[^0-9.+-]', '', str(val)))
+            return f"{v:+.2f}%"
+        except Exception:
+            return str(val)
+    pr_txt = None
+    for c in ['predicted_return_pct','xgb_predicted_return_pct','lstm_predicted_return_pct']:
+        if c in st.session_state.top_stocks_df.columns:
+            pr_txt = _fmt_ret(best_stock.get(c))
+            break
+    pr_txt = pr_txt or 'n/a'
+    st.success(f"**{best_stock['ticker']}** - Predicted Return: **{pr_txt}**")
+    # Confidence/Risk display with fallbacks
+    try:
+        import re
+        def _numfmt(x, fmt=".1f"):
+            try:
+                v = float(re.sub(r'[^0-9.+-]', '', str(x)))
+                return format(v, fmt)
+            except Exception:
+                return "n/a"
+        conf_val = None
+        # Prefer ensemble as overall confidence proxy if present
+        if 'ensemble_score' in st.session_state.top_stocks_df.columns:
+            conf_val = _numfmt(best_stock.get('ensemble_score'), ".3f")
+            conf_label = "Ensemble"
+        elif 'confidence_score' in st.session_state.top_stocks_df.columns:
+            conf_val = _numfmt(best_stock.get('confidence_score'), ".1f")
+            conf_label = "Confidence"
+        elif 'lstm_confidence_score' in st.session_state.top_stocks_df.columns:
+            conf_val = _numfmt(best_stock.get('lstm_confidence_score'), ".1f")
+            conf_label = "LSTM Conf"
+        else:
+            conf_label = "Confidence"
+            conf_val = "n/a"
+        # Risk fallback
+        risk_val = "n/a"
+        if 'risk_score' in st.session_state.top_stocks_df.columns:
+            risk_val = _numfmt(best_stock.get('risk_score'), ".1f")
+        elif 'lstm_risk_score' in st.session_state.top_stocks_df.columns:
+            risk_val = _numfmt(best_stock.get('lstm_risk_score'), ".1f")
+        st.write(f"{conf_label}: {conf_val}/100 | Risk: {risk_val}/100")
+    except Exception:
+        pass
     with col2:
-        st.metric("Current Price", f"${best_stock['close']:.2f}")
+        # Current price (robust parsing)
+        try:
+            import re
+            cval = float(re.sub(r'[^0-9.+-]','', str(best_stock.get('close',''))))
+            st.metric("Current Price", f"${cval:.2f}")
+        except Exception:
+            st.metric("Current Price", str(best_stock.get('close','n/a')))
     with col3:
-        st.metric("Predicted Change", f"${best_stock['predicted_change']:+.2f}")
+        # Predicted change: compute if not present
+        try:
+            import re, math
+            if 'predicted_change' in best_stock.index:
+                pc = float(re.sub(r'[^0-9.+-]','', str(best_stock.get('predicted_change',''))))
+            else:
+                # derive from predicted return pct and close
+                pr_num = None
+                for c in ['predicted_return_pct','xgb_predicted_return_pct','lstm_predicted_return_pct','lstm_pred']:
+                    if c in best_stock.index:
+                        try:
+                            pr_num = float(re.sub(r'[^0-9.+-]','', str(best_stock.get(c,''))))
+                            break
+                        except Exception:
+                            continue
+                cnum = float(re.sub(r'[^0-9.+-]','', str(best_stock.get('close','')))) if 'close' in best_stock.index else float('nan')
+                pc = (pr_num / 100.0) * cnum if pr_num is not None and math.isfinite(cnum) else float('nan')
+            st.metric("Predicted Change", f"${pc:+.2f}" if pc == pc else "n/a")
+        except Exception:
+            st.metric("Predicted Change", "n/a")
     
     # --- Detailed Stock Analysis ---
     if st.button("🔍 Analyze Top Pick"):
@@ -307,12 +488,17 @@ if not st.session_state.top_stocks_df.empty:
             
             with col1:
                 st.write("**Technical Signals**")
+                def _fmt_float(_v, _nd=2):
+                    try:
+                        return f"{float(_v):.{_nd}f}"
+                    except Exception:
+                        return str(_v)
                 for signal, value in analysis['technical_signals'].items():
                     if isinstance(value, bool):
                         status = "✅" if value else "❌"
                         st.write(f"{status} {signal.replace('_', ' ').title()}")
                     else:
-                        st.write(f"📊 {signal.replace('_', ' ').title()}: {value:.2f}")
+                        st.write(f"📊 {signal.replace('_', ' ').title()}: {_fmt_float(value, 2)}")
             
             with col2:
                 st.write("**Fundamental Signals**")
@@ -321,21 +507,74 @@ if not st.session_state.top_stocks_df.empty:
                         status = "✅" if value else "❌"
                         st.write(f"{status} {signal.replace('_', ' ').title()}")
                     else:
-                        st.write(f"📊 {signal.replace('_', ' ').title()}: {value:.2f}")
+                        st.write(f"📊 {signal.replace('_', ' ').title()}: {_fmt_float(value, 2)}")
             
             with col3:
                 st.write("**Risk Metrics**")
                 for metric, value in analysis['risk_metrics'].items():
-                    st.write(f"📊 {metric.replace('_', ' ').title()}: {value:.2f}")
+                    st.write(f"📊 {metric.replace('_', ' ').title()}: {_fmt_float(value, 2)}")
     
     # --- Stock Price Chart Analysis ---
     st.header("📈 3-Week Price Chart Analysis")
     
     # Load historical price data
+    step_ctx = "read_prices_csv"
     try:
-        stock_prices_path = os.getenv('STOCK_PRICES_CSV', 'data/stock_prices.csv')
+        def _pick_prices_csv():
+            env_path = os.getenv('STOCK_PRICES_CSV')
+            candidates = []
+            if env_path:
+                candidates.append(env_path)
+            candidates += [
+                'data/input/stock_prices_with_clean_data.csv',
+                'data/input/stock_prices_filtered.csv',
+                'data/input/stock_prices.csv',
+                'data/stock_prices.csv',
+            ]
+            for _p in candidates:
+                # Resolve relative paths against project root
+                _abs = _p if os.path.isabs(_p) else os.path.join(PRJ_DIR, _p)
+                if os.path.exists(_abs):
+                    return _abs
+            return None
+
+        stock_prices_path = _pick_prices_csv()
+        if not stock_prices_path:
+            raise FileNotFoundError("No historical prices CSV found. Set STOCK_PRICES_CSV or place clean prices at data/input/stock_prices_with_clean_data.csv")
         stock_data = pd.read_csv(stock_prices_path)
+        # Ensure 'ticker' column exists even if source uses 'symbol'
+        if 'ticker' not in stock_data.columns and 'symbol' in stock_data.columns:
+            try:
+                stock_data['ticker'] = stock_data['symbol'].astype(str).str.upper()
+            except Exception:
+                pass
+        # Helper: validate and coerce numeric columns; log offending values
+        step_ctx = "coerce_prices_numeric"
+        def _validate_numeric_columns(df, cols, label):
+            issues = []
+            for _c in cols:
+                if _c in df.columns:
+                    coerced = pd.to_numeric(df[_c], errors='coerce')
+                    # Identify non-numeric strings (original non-null that became NaN)
+                    bad_mask = coerced.isna() & df[_c].notna()
+                    if bool(bad_mask.any()):
+                        samples = df.loc[bad_mask, _c].astype(str).unique().tolist()[:5]
+                        issues.append(f"{_c}: {bad_mask.sum()} non-numeric (e.g., {samples})")
+                    df[_c] = coerced
+            if issues:
+                import textwrap as _tw
+                msg = "\n".join(_tw.wrap("; ".join(issues), width=120))
+                try:
+                    st.warning(f"Data validation for {label}: detected non-numeric values → {msg}")
+                except Exception:
+                    print(f"[UI VALIDATION] {label}: {msg}")
+            return df
+        stock_data = _validate_numeric_columns(stock_data, ['open','high','low','close','volume'], 'stock_prices.csv')
         st.success("✅ Historical price data loaded successfully")
+        try:
+            st.caption(f"Using prices from: {stock_prices_path}")
+        except Exception:
+            pass
         
         # Create stock selector
         available_tickers = st.session_state.top_stocks_df['ticker'].tolist()
@@ -349,26 +588,43 @@ if not st.session_state.top_stocks_df.empty:
         if selected_ticker:
             # Load complete featured data to get all technical indicators
             try:
-                # Prefer merged weekly features+ranked output for richest technicals
-                weekly_path = 'data/top/xgb_weekly_output.csv'
-                if os.path.exists(weekly_path):
-                    complete_featured_data = pd.read_csv(weekly_path)
-                else:
-                    # Env may point to legacy path; add robust fallbacks
-                    env_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
-                    try_paths = [env_path, 'data/top/featured_stocks_top.csv', 'data/featured_stocks_top.csv']
-                    picked = None
-                    for _p in try_paths:
-                        if os.path.exists(_p):
-                            picked = _p
-                            break
-                    if picked is None:
-                        raise FileNotFoundError(f"No featured stocks CSV found in {try_paths}")
-                    complete_featured_data = pd.read_csv(picked)
+                # Prefer full technical features if available, then model outputs, then legacy featured
+                step_ctx = "load_weekly_output"
+                candidates = [
+                    os.path.join(PRJ_DIR, 'data', 'features', 'stock_features_clean.csv'),
+                    os.path.join(PRJ_DIR, 'data', 'xgboost', 'xgboost_weekly_output.csv'),
+                    os.path.join(PRJ_DIR, 'data', 'ensemble', 'ensemble_weekly_output.csv'),
+                ]
+                env_path = os.getenv('FEATURED_STOCKS_CSV', 'data/featured_stocks_top.csv')
+                legacy = [env_path, 'data/top/featured_stocks_top.csv', 'data/featured_stocks_top.csv']
+                candidates += [p if os.path.isabs(p) else os.path.join(PRJ_DIR, p) for p in legacy]
+                picked = None
+                for _p in candidates:
+                    if os.path.exists(_p):
+                        picked = _p
+                        break
+                if picked is None:
+                    raise FileNotFoundError("No featured/feature dataset found for technicals")
+                complete_featured_data = pd.read_csv(picked)
+                step_ctx = "normalize_featured_cols"
                 if 'ticker' in complete_featured_data.columns:
                     complete_featured_data['ticker'] = complete_featured_data['ticker'].astype(str).str.upper()
+                # Coerce common numeric fields to numeric to avoid f-string format errors downstream
+                try:
+                    _num_cols = [
+                        'close','open','high','low','volume',
+                        'support_20d','resistance_20d','rsi_14d',
+                        'momentum_5d','momentum_10d','momentum_20d','momentum_30d','momentum_60d',
+                        'predicted_return_pct','confidence_score','risk_score','composite_score'
+                    ]
+                    for _c in _num_cols:
+                        if _c in complete_featured_data.columns:
+                            complete_featured_data[_c] = pd.to_numeric(complete_featured_data[_c], errors='coerce')
+                except Exception:
+                    pass
                 stock_featured_data = complete_featured_data[complete_featured_data['ticker'] == selected_ticker].iloc[0]
                 # Backfill support/resistance if missing from weekly output
+                step_ctx = "backfill_support_resistance"
                 try:
                     need_sr = []
                     for _c in ['support_20d', 'resistance_20d']:
@@ -409,17 +665,73 @@ if not st.session_state.top_stocks_df.empty:
                 except Exception:
                     pass
                 
-                # Get predicted return and confidence data from filtered stocks if available
+                # Backfill RSI and momentum from price history if missing
+                try:
+                    need_ta = []
+                    for _c in ['rsi_14d', 'momentum_5d', 'momentum_10d']:
+                        if _c not in stock_featured_data.index or pd.isna(stock_featured_data.get(_c)):
+                            need_ta.append(_c)
+                    if need_ta:
+                        _td2 = stock_data[stock_data['ticker'] == selected_ticker].copy()
+                        if not _td2.empty and 'close' in _td2.columns:
+                            _td2['date'] = pd.to_datetime(_td2['date'], errors='coerce')
+                            _td2 = _td2.sort_values('date')
+                            _price = pd.to_numeric(_td2['close'], errors='coerce')
+                            if 'rsi_14d' in need_ta and _price.notna().sum() >= 14:
+                                _delta = _price.diff(1)
+                                _gain = _delta.where(_delta > 0, 0.0).rolling(window=14, min_periods=14).mean()
+                                _loss = (-_delta.where(_delta < 0, 0.0)).rolling(window=14, min_periods=14).mean()
+                                _rs = _gain / _loss
+                                _rsi = 100 - (100 / (1 + _rs))
+                                try:
+                                    stock_featured_data['rsi_14d'] = float(_rsi.iloc[-1])
+                                except Exception:
+                                    pass
+                            if 'momentum_5d' in need_ta and len(_price) > 5:
+                                try:
+                                    stock_featured_data['momentum_5d'] = float(_price.pct_change(5).iloc[-1])
+                                except Exception:
+                                    pass
+                            if 'momentum_10d' in need_ta and len(_price) > 10:
+                                try:
+                                    stock_featured_data['momentum_10d'] = float(_price.pct_change(10).iloc[-1])
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+                # Get predicted return and confidence data from filtered stocks if available (robust columns)
                 if not st.session_state.top_stocks_df.empty:
                     filtered_stock_data = st.session_state.top_stocks_df[st.session_state.top_stocks_df['ticker'] == selected_ticker]
                     if not filtered_stock_data.empty:
                         filtered_row = filtered_stock_data.iloc[0]
-                        # Add predicted return and confidence data to stock_featured_data
-                        stock_featured_data['predicted_return_pct'] = filtered_row.get('predicted_return_pct', 'N/A')
-                        stock_featured_data['confidence_score'] = filtered_row.get('confidence_score', 'N/A')
-                        stock_featured_data['predicted_change'] = filtered_row.get('predicted_change', 'N/A')
-                        stock_featured_data['risk_score'] = filtered_row.get('risk_score', 'N/A')
-                        stock_featured_data['composite_score'] = filtered_row.get('composite_score', 'N/A')
+                        # Predicted return: prefer combined/xgb/lstm
+                        _pred_candidates = [
+                            'predicted_return_pct', 'xgb_predicted_return_pct', 'lstm_predicted_return_pct',
+                            'xgb_pred', 'lstm_pred'
+                        ]
+                        for _pc in _pred_candidates:
+                            if _pc in filtered_row.index and pd.notna(filtered_row.get(_pc)):
+                                stock_featured_data['predicted_return_pct'] = filtered_row.get(_pc)
+                                break
+                        # Confidence: max across available confidence columns
+                        _conf_candidates = [
+                            'confidence_score', 'xgb_confidence_score', 'lstm_confidence_score',
+                            'confidence_score_xgb', 'confidence_score_lstm'
+                        ]
+                        _confs = []
+                        for _cc in _conf_candidates:
+                            if _cc in filtered_row.index:
+                                try:
+                                    _confs.append(float(str(filtered_row.get(_cc)).replace('%','')))
+                                except Exception:
+                                    continue
+                        if _confs:
+                            stock_featured_data['confidence_score'] = max(_confs)
+                        # Other optional fields
+                        for _k in ['predicted_change', 'risk_score', 'composite_score']:
+                            if _k in filtered_row.index and pd.notna(filtered_row.get(_k)):
+                                stock_featured_data[_k] = filtered_row.get(_k)
                 
                 st.success(f"✅ Complete technical data loaded for {selected_ticker}")
             except Exception as e:
@@ -442,11 +754,20 @@ if not st.session_state.top_stocks_df.empty:
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        st.metric("Current Price", f"${stock_featured_data['close']:.2f}")
-                        if not pd.isna(stock_featured_data.get('resistance_20d')):
-                            st.metric("Resistance Level", f"${stock_featured_data['resistance_20d']:.2f}")
-                        if not pd.isna(stock_featured_data.get('support_20d')):
-                            st.metric("Support Level", f"${stock_featured_data['support_20d']:.2f}")
+                        import re as _re
+                        def _num(x):
+                            try:
+                                return float(_re.sub(r'[^0-9.+-]', '', str(x)))
+                            except Exception:
+                                return float('nan')
+                        _cp = _num(stock_featured_data.get('close'))
+                        _res = _num(stock_featured_data.get('resistance_20d'))
+                        _sup = _num(stock_featured_data.get('support_20d'))
+                        st.metric("Current Price", f"${_cp:.2f}" if _cp == _cp else str(stock_featured_data.get('close','N/A')))
+                        if not pd.isna(_res):
+                            st.metric("Resistance Level", f"${_res:.2f}")
+                        if not pd.isna(_sup):
+                            st.metric("Support Level", f"${_sup:.2f}")
                     
                     with col2:
                         rsi_value = stock_featured_data.get('rsi_14d')
@@ -464,16 +785,20 @@ if not st.session_state.top_stocks_df.empty:
                     with col3:
                         resistance_status = "🟢 BROKEN" if stock_featured_data.get('broke_resistance', False) else "🔴 HOLDING"
                         st.metric("Resistance Status", resistance_status)
-                        # Check if predicted_return_pct exists in the data
-                        if 'predicted_return_pct' in stock_featured_data:
-                            st.metric("Predicted Return", f"{stock_featured_data['predicted_return_pct']:.2f}%")
-                        else:
-                            st.metric("Predicted Return", "N/A")
-                        # Check if confidence_score exists in the data
-                        if 'confidence_score' in stock_featured_data:
-                            st.metric("Confidence Score", f"{stock_featured_data['confidence_score']:.1f}/100")
-                        else:
-                            st.metric("Confidence Score", "N/A")
+                        # Predicted Return
+                        _pr = stock_featured_data.get('predicted_return_pct')
+                        try:
+                            _prn = float(_pr)
+                            st.metric("Predicted Return", f"{_prn:.2f}%")
+                        except Exception:
+                            st.metric("Predicted Return", str(_pr) if _pr is not None else "N/A")
+                        # Confidence Score
+                        _cs = stock_featured_data.get('confidence_score')
+                        try:
+                            _csn = float(_cs)
+                            st.metric("Confidence Score", f"{_csn:.1f}/100")
+                        except Exception:
+                            st.metric("Confidence Score", str(_cs) if _cs is not None else "N/A")
                     
                     # Add key price levels section
                     st.subheader("🎯 Key Price Levels & Validation")
@@ -483,21 +808,20 @@ if not st.session_state.top_stocks_df.empty:
                     with col1:
                         # Resistance break price
                         if stock_featured_data.get('broke_resistance', False):
-                            resistance_level = stock_featured_data.get('resistance_20d')
-                            current_price = stock_featured_data['close']
-                            if resistance_level is not None and not pd.isna(resistance_level):
+                            resistance_level = _num(stock_featured_data.get('resistance_20d'))
+                            current_price = _num(stock_featured_data.get('close'))
+                            if resistance_level == resistance_level:
                                 price_above_resistance = current_price - resistance_level
                                 st.metric(
                                     "🟢 Resistance Break Price", 
                                     f"${resistance_level:.2f}",
                                     delta=f"+${price_above_resistance:.2f} above resistance"
                                 )
-                                # Add additional info about the resistance break
                                 st.info(f"**Resistance Level**: ${resistance_level:.2f} was broken. Current price ${current_price:.2f} is ${price_above_resistance:.2f} above resistance.")
                         else:
-                            resistance_level = stock_featured_data.get('resistance_20d')
-                            current_price = stock_featured_data['close']
-                            if resistance_level is not None and not pd.isna(resistance_level):
+                            resistance_level = _num(stock_featured_data.get('resistance_20d'))
+                            current_price = _num(stock_featured_data.get('close'))
+                            if resistance_level == resistance_level:
                                 distance_to_resistance = resistance_level - current_price
                                 st.metric(
                                     "🔴 Resistance Level", 
@@ -509,16 +833,15 @@ if not st.session_state.top_stocks_df.empty:
                                 st.metric("🔴 Resistance Break Price", "Not broken yet")
                         
                         # Support level
-                        support_level = stock_featured_data.get('support_20d')
-                        if support_level is not None and not pd.isna(support_level):
-                            current_price = stock_featured_data['close']
+                        support_level = _num(stock_featured_data.get('support_20d'))
+                        if support_level == support_level:
+                            current_price = _num(stock_featured_data.get('close'))
                             distance_from_support = current_price - support_level
                             st.metric(
                                 "🟢 Support Level", 
                                 f"${support_level:.2f}",
                                 delta=f"+${distance_from_support:.2f} above support"
                             )
-                            # Add additional info about support level
                             st.info(f"**Support Level**: ${support_level:.2f}. Current price ${current_price:.2f} is ${distance_from_support:.2f} above support.")
                         else:
                             st.metric("🔴 Support Level", "Not available")
@@ -554,11 +877,11 @@ if not st.session_state.top_stocks_df.empty:
                     # Add resistance price details
                     st.subheader("🎯 Resistance Price Analysis")
                     
-                    resistance_level = stock_featured_data.get('resistance_20d')
-                    current_price = stock_featured_data['close']
+                    resistance_level = _num(stock_featured_data.get('resistance_20d'))
+                    current_price = _num(stock_featured_data.get('close'))
                     broke_resistance = stock_featured_data.get('broke_resistance', False)
                     
-                    if resistance_level is not None and not pd.isna(resistance_level):
+                    if resistance_level == resistance_level:
                         col1, col2 = st.columns(2)
                         
                         with col1:
@@ -603,10 +926,10 @@ if not st.session_state.top_stocks_df.empty:
                     # Add support level analysis
                     st.subheader("🎯 Support Level Analysis")
                     
-                    support_level = stock_featured_data.get('support_20d')
-                    current_price = stock_featured_data['close']
+                    support_level = _num(stock_featured_data.get('support_20d'))
+                    current_price = _num(stock_featured_data.get('close'))
                     
-                    if support_level is not None and not pd.isna(support_level):
+                    if support_level == support_level:
                         col1, col2 = st.columns(2)
                         
                         with col1:
@@ -1046,11 +1369,11 @@ if not st.session_state.top_stocks_df.empty:
                     st.error(f"Error loading earnings data: {str(e)}")
                     st.info("Make sure the earnings_history.csv file is available in the data folder.")
                 
-                resistance_level = stock_featured_data.get('resistance_20d')
-                current_price = stock_featured_data['close']
+                resistance_level = _num(stock_featured_data.get('resistance_20d'))
+                current_price = _num(stock_featured_data.get('close'))
                 broke_resistance = stock_featured_data.get('broke_resistance', False)
                 
-                if resistance_level is not None and not pd.isna(resistance_level):
+                if resistance_level == resistance_level:
                     col1, col2 = st.columns(2)
                     
                     with col1:
@@ -1095,10 +1418,10 @@ if not st.session_state.top_stocks_df.empty:
                 # Add support level analysis
                 st.subheader("🎯 Support Level Analysis")
                 
-                support_level = stock_featured_data.get('support_20d')
-                current_price = stock_featured_data['close']
+                support_level = _num(stock_featured_data.get('support_20d'))
+                current_price = _num(stock_featured_data.get('close'))
                 
-                if support_level is not None and not pd.isna(support_level):
+                if support_level == support_level:
                     col1, col2 = st.columns(2)
                     
                     with col1:
@@ -1137,179 +1460,182 @@ if not st.session_state.top_stocks_df.empty:
                             st.write("🎯 **Watch For**: Price bouncing back above support")
                 else:
                     st.warning("Support level data not available for this stock.")
-                
-                # Add detailed technical insights
-                st.subheader("🔍 Technical Insights")
-                
-                insights = []
-                
-                # Resistance analysis
-                if stock_featured_data.get('broke_resistance', False):
-                    insights.append("🟢 **Resistance Break**: Price has successfully broken above the 20-day resistance level, indicating bullish momentum.")
-                else:
-                    insights.append("🔴 **Resistance Test**: Price is testing the resistance level. A break above could signal upward momentum.")
-                
-                # RSI analysis
-                rsi = stock_featured_data.get('rsi_14d')
-                if rsi is not None and not pd.isna(rsi):
-                    if rsi > 70:
-                        insights.append("⚠️ **Overbought**: RSI above 70 suggests the stock may be overbought and could face resistance.")
-                    elif rsi < 30:
-                        insights.append("🟢 **Oversold**: RSI below 30 suggests the stock may be oversold and could bounce back.")
+                    
+                    # Add detailed technical insights
+                    st.subheader("🔍 Technical Insights")
+                    
+                    insights = []
+                    
+                    # Resistance analysis
+                    if stock_featured_data.get('broke_resistance', False):
+                        insights.append("🟢 **Resistance Break**: Price has successfully broken above the 20-day resistance level, indicating bullish momentum.")
                     else:
-                        insights.append("📊 **Neutral RSI**: RSI in neutral territory, no extreme overbought/oversold conditions.")
-                else:
-                    insights.append("📊 **RSI**: RSI data not available for analysis.")
-                
-                # Momentum analysis
-                momentum_5d = stock_featured_data.get('momentum_5d')
-                momentum_10d = stock_featured_data.get('momentum_10d')
-                
-                if momentum_5d is not None and momentum_10d is not None and not pd.isna(momentum_5d) and not pd.isna(momentum_10d):
-                    if momentum_5d > 0 and momentum_10d > 0:
-                        insights.append("🚀 **Positive Momentum**: Both 5-day and 10-day momentum are positive, indicating upward price movement.")
-                    elif momentum_5d < 0 and momentum_10d < 0:
-                        insights.append("📉 **Negative Momentum**: Both 5-day and 10-day momentum are negative, indicating downward pressure.")
+                        insights.append("🔴 **Resistance Test**: Price is testing the resistance level. A break above could signal upward momentum.")
+                    
+                    # RSI analysis
+                    rsi = stock_featured_data.get('rsi_14d')
+                    if rsi is not None and not pd.isna(rsi):
+                        if rsi > 70:
+                            insights.append("⚠️ **Overbought**: RSI above 70 suggests the stock may be overbought and could face resistance.")
+                        elif rsi < 30:
+                            insights.append("🟢 **Oversold**: RSI below 30 suggests the stock may be oversold and could bounce back.")
+                        else:
+                            insights.append("📊 **Neutral RSI**: RSI in neutral territory, no extreme overbought/oversold conditions.")
                     else:
-                        insights.append("📊 **Mixed Momentum**: Short-term and medium-term momentum are mixed, suggesting consolidation.")
-                else:
-                    insights.append("📊 **Momentum**: Momentum data not available for analysis.")
-                
-                # Display insights
-                for insight in insights:
-                    st.write(insight)
-                
-                # Add comprehensive chart interpretation guide
-                st.subheader("📚 How to Interpret the Chart for Investment Decisions")
-                
-                # Create expandable sections for different signal types
-                with st.expander("🟢 Bullish Signals (Good to Buy)", expanded=False):
-                    st.markdown("""
-                    **Resistance Break**: Price closes above the red resistance line
-                    - Look for the 🟢 Resistance Break annotation on the chart
-                    - This indicates strong buying pressure and potential upward movement
+                        insights.append("📊 **RSI**: RSI data not available for analysis.")
                     
-                    **Green Candlesticks**: Multiple consecutive green days
-                    - Shows consistent buying pressure
-                    - Each green candle means the day closed higher than it opened
+                    # Momentum analysis
+                    momentum_5d = stock_featured_data.get('momentum_5d')
+                    momentum_10d = stock_featured_data.get('momentum_10d')
                     
-                    **High Volume**: Volume increases with price gains
-                    - Check the gray volume bars at the bottom
-                    - Higher bars with price increases confirm strong buying interest
+                    if momentum_5d is not None and momentum_10d is not None and not pd.isna(momentum_5d) and not pd.isna(momentum_10d):
+                        if momentum_5d > 0 and momentum_10d > 0:
+                            insights.append("🚀 **Positive Momentum**: Both 5-day and 10-day momentum are positive, indicating upward price movement.")
+                        elif momentum_5d < 0 and momentum_10d < 0:
+                            insights.append("📉 **Negative Momentum**: Both 5-day and 10-day momentum are negative, indicating downward pressure.")
+                        else:
+                            insights.append("📊 **Mixed Momentum**: Short-term and medium-term momentum are mixed, suggesting consolidation.")
+                    else:
+                        insights.append("📊 **Momentum**: Momentum data not available for analysis.")
                     
-                    **RSI 30-70**: Stock is not overbought
-                    - RSI in the neutral range allows for continued upside
-                    - Avoid stocks with RSI > 70 (overbought)
+                    # Display insights
+                    for insight in insights:
+                        st.write(insight)
                     
-                    **Momentum Point**: Recent strong upward movement
-                    - Look for the 🚀 Momentum annotation on the chart
-                    - Shows the peak of recent buying pressure
-                    """)
-                
-                with st.expander("🔴 Bearish Signals (Avoid or Sell)", expanded=False):
-                    st.markdown("""
-                    **Support Break**: Price closes below the green support line
-                    - This indicates potential further downside
-                    - Support level acts as a floor for the stock price
+                    # Add comprehensive chart interpretation guide
+                    st.subheader("📚 How to Interpret the Chart for Investment Decisions")
                     
-                    **Red Candlesticks**: Multiple consecutive red days
-                    - Shows consistent selling pressure
-                    - Each red candle means the day closed lower than it opened
+                    # Create expandable sections for different signal types
+                    with st.expander("🟢 Bullish Signals (Good to Buy)", expanded=False):
+                        st.markdown("""
+                        **Resistance Break**: Price closes above the red resistance line
+                        - Look for the 🟢 Resistance Break annotation on the chart
+                        - This indicates strong buying pressure and potential upward movement
+                        
+                        **Green Candlesticks**: Multiple consecutive green days
+                        - Shows consistent buying pressure
+                        - Each green candle means the day closed higher than it opened
+                        
+                        **High Volume**: Volume increases with price gains
+                        - Check the gray volume bars at the bottom
+                        - Higher bars with price increases confirm strong buying interest
+                        
+                        **RSI 30-70**: Stock is not overbought
+                        - RSI in the neutral range allows for continued upside
+                        - Avoid stocks with RSI > 70 (overbought)
+                        
+                        **Momentum Point**: Recent strong upward movement
+                        - Look for the 🚀 Momentum annotation on the chart
+                        - Shows the peak of recent buying pressure
+                        """)
                     
-                    **High Volume Down**: High volume with price declines
-                    - High volume bars with price drops indicate strong selling
-                    - This confirms bearish sentiment
+                    with st.expander("🔴 Bearish Signals (Avoid or Sell)", expanded=False):
+                        st.markdown("""
+                        **Support Break**: Price closes below the green support line
+                        - This indicates potential further downside
+                        - Support level acts as a floor for the stock price
+                        
+                        **Red Candlesticks**: Multiple consecutive red days
+                        - Shows consistent selling pressure
+                        - Each red candle means the day closed lower than it opened
+                        
+                        **High Volume Down**: High volume with price declines
+                        - High volume bars with price drops indicate strong selling
+                        - This confirms bearish sentiment
+                        
+                        **RSI >70**: Stock is overbought and may pull back
+                        - RSI above 70 suggests the stock may be due for a correction
+                        - Consider taking profits or waiting for a pullback
+                        
+                        **Low Volume**: Lack of buying interest
+                        - Small volume bars indicate lack of conviction
+                        - Price movements without volume are less reliable
+                        """)
                     
-                    **RSI >70**: Stock is overbought and may pull back
-                    - RSI above 70 suggests the stock may be due for a correction
-                    - Consider taking profits or waiting for a pullback
+                    with st.expander("📊 Neutral/Consolidation", expanded=False):
+                        st.markdown("""
+                        **Small Candlesticks**: Price moving sideways
+                        - Small candle bodies indicate indecision
+                        - Stock is consolidating before next move
+                        
+                        **Low Volume**: Lack of strong directional movement
+                        - Low volume suggests lack of conviction
+                        - Wait for volume confirmation before making decisions
+                        
+                        **RSI 40-60**: Neutral momentum
+                        - RSI in middle range indicates balanced buying/selling
+                        - Stock is not overbought or oversold
+                        """)
                     
-                    **Low Volume**: Lack of buying interest
-                    - Small volume bars indicate lack of conviction
-                    - Price movements without volume are less reliable
-                    """)
-                
-                with st.expander("📊 Neutral/Consolidation", expanded=False):
-                    st.markdown("""
-                    **Small Candlesticks**: Price moving sideways
-                    - Small candle bodies indicate indecision
-                    - Stock is consolidating before next move
+                    with st.expander("📋 Technical Analysis Summary Section", expanded=False):
+                        st.markdown("""
+                        **Current Price Metrics**
+                        - **Current Price**: Latest closing price from the chart
+                        - **Resistance Level**: Price level to watch for breakouts (red line)
+                        - **Support Level**: Price level to watch for breakdowns (green line)
+                        
+                        **Momentum Indicators**
+                        - **RSI (14d)**:
+                          - 0-30: Oversold (potential buy opportunity)
+                          - 30-70: Normal trading range
+                          - 70-100: Overbought (potential sell signal)
+                        - **Momentum (5d)**: Short-term price change percentage
+                        - **Momentum (10d)**: Medium-term price change percentage
+                        
+                        **Status Indicators**
+                        - **Resistance Status**:
+                          - 🟢 BROKEN: Bullish signal - price above resistance
+                          - 🔴 HOLDING: Price still below resistance level
+                        - **Predicted Return**: AI model's forecast for price movement
+                        - **Confidence Score**: How confident the model is (0-100 scale)
+                        """)
                     
-                    **Low Volume**: Lack of strong directional movement
-                    - Low volume suggests lack of conviction
-                    - Wait for volume confirmation before making decisions
+                    with st.expander("🔍 Technical Insights Section", expanded=False):
+                        st.markdown("""
+                        **Resistance Analysis**
+                        - 🟢 **Resistance Break**: "Price has successfully broken above the 20-day resistance level, indicating bullish momentum"
+                        - 🔴 **Resistance Test**: "Price is testing the resistance level. A break above could signal upward momentum"
+                        
+                        **RSI Analysis**
+                        - ⚠️ **Overbought**: "RSI above 70 suggests the stock may be overbought and could face resistance"
+                        - 🟢 **Oversold**: "RSI below 30 suggests the stock may be oversold and could bounce back"
+                        - 📊 **Neutral RSI**: "RSI in neutral territory, no extreme overbought/oversold conditions"
+                        
+                        **Momentum Analysis**
+                        - 🚀 **Positive Momentum**: "Both 5-day and 10-day momentum are positive, indicating upward price movement"
+                        - 📉 **Negative Momentum**: "Both 5-day and 10-day momentum are negative, indicating downward pressure"
+                        - 📊 **Mixed Momentum**: "Short-term and medium-term momentum are mixed, suggesting consolidation"
+                        """)
                     
-                    **RSI 40-60**: Neutral momentum
-                    - RSI in middle range indicates balanced buying/selling
-                    - Stock is not overbought or oversold
-                    """)
-                
-                with st.expander("📋 Technical Analysis Summary Section", expanded=False):
-                    st.markdown("""
-                    **Current Price Metrics**
-                    - **Current Price**: Latest closing price from the chart
-                    - **Resistance Level**: Price level to watch for breakouts (red line)
-                    - **Support Level**: Price level to watch for breakdowns (green line)
-                    
-                    **Momentum Indicators**
-                    - **RSI (14d)**:
-                      - 0-30: Oversold (potential buy opportunity)
-                      - 30-70: Normal trading range
-                      - 70-100: Overbought (potential sell signal)
-                    - **Momentum (5d)**: Short-term price change percentage
-                    - **Momentum (10d)**: Medium-term price change percentage
-                    
-                    **Status Indicators**
-                    - **Resistance Status**:
-                      - 🟢 BROKEN: Bullish signal - price above resistance
-                      - 🔴 HOLDING: Price still below resistance level
-                    - **Predicted Return**: AI model's forecast for price movement
-                    - **Confidence Score**: How confident the model is (0-100 scale)
-                    """)
-                
-                with st.expander("🔍 Technical Insights Section", expanded=False):
-                    st.markdown("""
-                    **Resistance Analysis**
-                    - 🟢 **Resistance Break**: "Price has successfully broken above the 20-day resistance level, indicating bullish momentum"
-                    - 🔴 **Resistance Test**: "Price is testing the resistance level. A break above could signal upward momentum"
-                    
-                    **RSI Analysis**
-                    - ⚠️ **Overbought**: "RSI above 70 suggests the stock may be overbought and could face resistance"
-                    - 🟢 **Oversold**: "RSI below 30 suggests the stock may be oversold and could bounce back"
-                    - 📊 **Neutral RSI**: "RSI in neutral territory, no extreme overbought/oversold conditions"
-                    
-                    **Momentum Analysis**
-                    - 🚀 **Positive Momentum**: "Both 5-day and 10-day momentum are positive, indicating upward price movement"
-                    - 📉 **Negative Momentum**: "Both 5-day and 10-day momentum are negative, indicating downward pressure"
-                    - 📊 **Mixed Momentum**: "Short-term and medium-term momentum are mixed, suggesting consolidation"
-                    """)
-                
-                with st.expander("💡 Practical Investment Strategy", expanded=False):
-                    st.markdown("""
-                    **For Buying (Entry Points)**
-                    1. **Wait for resistance break** with high volume
-                    2. **Buy on pullbacks** to support level
-                    3. **Look for oversold RSI** (<30) for bounce-back opportunities
-                    4. **Confirm with positive momentum** (5d and 10d both positive)
-                    
-                    **For Selling (Exit Points)**
-                    1. **Sell on resistance rejection** (price fails to break above resistance)
-                    2. **Exit on support break** (price closes below support)
-                    3. **Take profits on overbought RSI** (>70)
-                    4. **Watch for negative momentum** (both 5d and 10d negative)
-                    
-                    **Risk Management**
-                    - **Set stop-loss** below support level
-                    - **Take partial profits** at resistance levels
-                    - **Don't chase overbought stocks** (RSI >70)
-                    - **Use volume confirmation** for major moves
-                    """)
+                    with st.expander("💡 Practical Investment Strategy", expanded=False):
+                        st.markdown("""
+                        **For Buying (Entry Points)**
+                        1. **Wait for resistance break** with high volume
+                        2. **Buy on pullbacks** to support level
+                        3. **Look for oversold RSI** (<30) for bounce-back opportunities
+                        4. **Confirm with positive momentum** (5d and 10d both positive)
+                        
+                        **For Selling (Exit Points)**
+                        1. **Sell on resistance rejection** (price fails to break above resistance)
+                        2. **Exit on support break** (price closes below support)
+                        3. **Take profits on overbought RSI** (>70)
+                        4. **Watch for negative momentum** (both 5d and 10d negative)
+                        
+                        **Risk Management**
+                        - **Set stop-loss** below support level
+                        - **Take partial profits** at resistance levels
+                        - **Don't chase overbought stocks** (RSI >70)
+                        - **Use volume confirmation** for major moves
+                        """)
                     
         else:
             st.warning(f"Could not create chart for {selected_ticker}. Insufficient historical data.")
                 
     except Exception as e:
-        st.error(f"❌ Error loading historical price data: {str(e)}")
+        try:
+            st.error(f"❌ Error loading historical price data at step '{step_ctx}': {e}")
+        except Exception:
+            print(f"[UI ERROR] price data load failed at step '{step_ctx}': {e}")
         st.info("💡 Make sure the stock price data file is available in the data folder.")
     
     # --- Visualizations ---
@@ -1321,45 +1647,117 @@ if not st.session_state.top_stocks_df.empty:
     with tab1:
         # Stock rankings chart (exclude low-priced stocks < $3)
         _chart_df = st.session_state.top_stocks_df.copy()
-        if 'close' in _chart_df.columns:
+        # pick y-column dynamically
+        y_col = 'predicted_return_pct'
+        if y_col not in _chart_df.columns:
+            y_col = 'xgb_predicted_return_pct' if 'xgb_predicted_return_pct' in _chart_df.columns else (
+                'lstm_predicted_return_pct' if 'lstm_predicted_return_pct' in _chart_df.columns else None)
+        # As a last resort, synthesize predicted_return_pct from available columns
+        if y_col is None:
             try:
-                _chart_df = _chart_df[pd.to_numeric(_chart_df['close'], errors='coerce') >= 3]
+                import numpy as _np
+                _cands = [
+                    'predicted_return_pct', 'xgb_predicted_return_pct', 'lstm_predicted_return_pct',
+                    'xgb_pred', 'lstm_pred'
+                ]
+                _present = [c for c in _cands if c in _chart_df.columns]
+                if _present:
+                    _vals = [pd.to_numeric(_chart_df[c], errors='coerce') for c in _present]
+                    _stack = _np.vstack([s.fillna(_np.nan).to_numpy() for s in _vals])
+                    _pred = _np.nanmean(_stack, axis=0)
+                    with _np.errstate(invalid='ignore'):
+                        _med = _np.nanmedian(_np.abs(_pred))
+                    if not (_med == _med) or _med <= 1:
+                        _pred = _pred * 100.0
+                    _chart_df['predicted_return_pct'] = _pred
+                    y_col = 'predicted_return_pct'
             except Exception:
                 pass
-        fig = px.bar(
-            _chart_df.head(num_stocks),
-            x='ticker',
-            y='predicted_return_pct',
-            color='confidence_score',
-            title="Top 10 Stocks by Predicted Return",
-            labels={'predicted_return_pct': 'Predicted Return (%)', 'confidence_score': 'Confidence Score'},
-            color_continuous_scale='RdYlGn'
-        )
-        fig.update_layout(title=f"Top {num_stocks} Stocks by Predicted Return")
-        fig.update_layout(height=500)
-        st.plotly_chart(fig, use_container_width=True)
+        # If still none, fall back to ensemble_score so we can render a chart
+        if y_col is None and 'ensemble_score' in _chart_df.columns:
+            y_col = 'ensemble_score'
+        if y_col is not None:
+            try:
+                if 'close' in _chart_df.columns:
+                    _chart_df = _chart_df[pd.to_numeric(_chart_df['close'], errors='coerce') >= 3]
+            except Exception:
+                pass
+            import plotly.express as px
+            fig = px.bar(
+                _chart_df.head(num_stocks),
+                x='ticker',
+                y=y_col,
+                color='confidence_score' if 'confidence_score' in _chart_df.columns else None,
+                title="Top Stocks by Predicted Return",
+                labels={y_col: 'Predicted Return (%)', 'confidence_score': 'Confidence Score'}
+            )
+            fig.update_layout(title=f"Top {num_stocks} Stocks by Predicted Return")
+            fig.update_layout(height=500)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info('No predicted return column available to plot.')
     
     with tab2:
-        # Risk vs Return scatter plot
+        # Risk vs Return scatter plot (robust column selection)
         _df_plot = st.session_state.top_stocks_df.copy()
-        # Plotly marker sizes must be non-negative
+        # Choose axes dynamically
+        x_col = 'risk_score' if 'risk_score' in _df_plot.columns else ('lstm_risk_score' if 'lstm_risk_score' in _df_plot.columns else None)
+        y_col = 'predicted_return_pct'
+        if y_col not in _df_plot.columns:
+            y_col = 'xgb_predicted_return_pct' if 'xgb_predicted_return_pct' in _df_plot.columns else (
+                'lstm_predicted_return_pct' if 'lstm_predicted_return_pct' in _df_plot.columns else (
+                    'lstm_pred' if 'lstm_pred' in _df_plot.columns else None))
+        # Synthesize predicted_return_pct if still missing
+        if y_col is None:
+            try:
+                import numpy as _np
+                _cands = [
+                    'predicted_return_pct', 'xgb_predicted_return_pct', 'lstm_predicted_return_pct',
+                    'xgb_pred', 'lstm_pred'
+                ]
+                _present = [c for c in _cands if c in _df_plot.columns]
+                if _present:
+                    _vals = [pd.to_numeric(_df_plot[c], errors='coerce') for c in _present]
+                    _stack = _np.vstack([s.fillna(_np.nan).to_numpy() for s in _vals])
+                    _pred = _np.nanmean(_stack, axis=0)
+                    with _np.errstate(invalid='ignore'):
+                        _med = _np.nanmedian(_np.abs(_pred))
+                    if not (_med == _med) or _med <= 1:
+                        _pred = _pred * 100.0
+                    _df_plot['predicted_return_pct'] = _pred
+                    y_col = 'predicted_return_pct'
+            except Exception:
+                pass
+        # If still missing, fall back to ensemble_score
+        if y_col is None and 'ensemble_score' in _df_plot.columns:
+            y_col = 'ensemble_score'
+        color_col = 'composite_score' if 'composite_score' in _df_plot.columns else ('lstm_composite_score' if 'lstm_composite_score' in _df_plot.columns else None)
+        # Marker size from confidence where available
         if 'confidence_score' in _df_plot.columns:
             _df_plot['confidence_size'] = _df_plot['confidence_score'].abs()
+        elif 'lstm_confidence_score' in _df_plot.columns:
+            _df_plot['confidence_size'] = _df_plot['lstm_confidence_score'].abs()
         else:
             _df_plot['confidence_size'] = 0.0
-        fig = px.scatter(
-            _df_plot,
-            x='risk_score',
-            y='predicted_return_pct',
-            size='confidence_size',
-            color='composite_score',
-            hover_data=['ticker'],
-            title="Risk vs Return Analysis",
-            labels={'risk_score': 'Risk Score', 'predicted_return_pct': 'Predicted Return (%)', 
-                   'confidence_size': 'Confidence (|score|)', 'composite_score': 'Composite Score'}
-        )
-        fig.update_layout(height=500)
-        st.plotly_chart(fig, use_container_width=True)
+        if x_col is None or y_col is None:
+            st.info('Not enough fields to plot Risk vs Return (missing risk or predicted return column).')
+        else:
+            import plotly.express as px
+            labels_map = {x_col: 'Risk Score', y_col: 'Predicted Return (%)', 'confidence_size': 'Confidence (|score|)'}
+            if color_col:
+                labels_map[color_col] = 'Composite Score'
+            fig = px.scatter(
+                _df_plot,
+                x=x_col,
+                y=y_col,
+                size='confidence_size',
+                color=color_col,
+                hover_data=['ticker'],
+                title="Risk vs Return Analysis",
+                labels=labels_map
+            )
+            fig.update_layout(height=500)
+            st.plotly_chart(fig, use_container_width=True)
     
     with tab3:
         # Technical signals heatmap
@@ -1437,13 +1835,19 @@ if not st.session_state.top_stocks_df.empty:
                 return _pd.read_csv(path) if _os.path.exists(path) else None
             except Exception:
                 return None
-        # Prefer merged weekly XGB output if present, else raw ranked
+        # If a prebuilt UI dataset exists, prefer it as the display source
+        ui_ds = _read_if_exists('data/top/ui_dataset.csv')
+        used_ui_ds = ui_ds is not None and ('ticker' in ui_ds.columns)
+        # Prefer merged weekly XGB output if present, else raw ranked (skip if using ui_ds)
         xgb_weekly = _read_if_exists('data/top/xgb_weekly_output.csv')
-        use_weekly = xgb_weekly is not None and 'ticker' in xgb_weekly.columns
+        use_weekly = (xgb_weekly is not None and 'ticker' in xgb_weekly.columns) and (not used_ui_ds)
         xgb_csv = _read_if_exists('data/top/xgb_ranked_output.csv') or _read_if_exists('data/top/xgb_ranked.csv')
         lstm_csv = _read_if_exists('data/top/lstm_weekly_predictions_output.csv') or _read_if_exists('data/top/lstm_weekly_predictions.csv')
         ens_csv = _read_if_exists('data/top/ensemble_scores_output.csv') or _read_if_exists('data/top/final_ensemble_scores.csv')
-        if use_weekly:
+        if used_ui_ds:
+            df_to_display = ui_ds.copy()
+            df_to_display['ticker'] = df_to_display['ticker'].astype(str).str.upper()
+        elif use_weekly:
             df_to_display = xgb_weekly.copy()
             df_to_display['ticker'] = df_to_display['ticker'].astype(str).str.upper()
         else:
@@ -1508,36 +1912,106 @@ if not st.session_state.top_stocks_df.empty:
             lstm_csv['ticker'] = lstm_csv['ticker'].astype(str).str.upper()
             df_to_display = df_to_display.merge(lstm_csv, on='ticker', how='left')
         if ens_csv is not None and 'ticker' in ens_csv.columns:
-            ens_csv['ticker'] = ens_csv['ticker'].astype(str).str.upper()
-            # Merge ensemble score and any available model columns if present
-            ens_cols = [c for c in ['ensemble_score', 'xgb_pred', 'xgb_predicted_return_pct', 'lstm_predicted_return_pct'] if c in ens_csv.columns]
-            merge_cols = ['ticker'] + ens_cols if ens_cols else ['ticker']
-            df_to_display = df_to_display.merge(ens_csv[merge_cols], on='ticker', how='left')
+            # Normalize ensemble
+            ens_csv['ticker'] = ens_csv['ticker'].astype(str).str.upper().str.strip()
+            ens_csv['ensemble_score'] = pd.to_numeric(ens_csv['ensemble_score'], errors='coerce')
+            ens_csv = ens_csv.dropna(subset=['ensemble_score'])
+            # Use ensemble file AS the source of truth (already top-25)
+            ens_top = ens_csv[['ticker','ensemble_score']].copy().sort_values('ensemble_score', ascending=False).reset_index(drop=True)
+            ens_top['ensemble_rank'] = ens_top.index + 1
+
+            # Choose a feature-rich source to join details: prefer xgb_features_latest, fallback to featured_stocks_top, then weekly
+            feat_all = None
+            try:
+                import pandas as _pd
+                _x = _read_if_exists('data/top/xgb_features_latest.csv')
+                _y = _read_if_exists('data/featured_stocks_top.csv')
+                _z = _read_if_exists('data/top/xgb_weekly_output.csv')
+                feat_all = _x if (_x is not None and 'ticker' in _x.columns) else (_y if (_y is not None and 'ticker' in _y.columns) else _z)
+            except Exception:
+                feat_all = None
+            if feat_all is None:
+                feat_all = df_to_display.copy()
+
+            # Normalize features and collapse to latest per ticker if needed
+            try:
+                feat_all['ticker'] = feat_all['ticker'].astype(str).str.upper().str.strip()
+                if 'date' in feat_all.columns:
+                    try:
+                        feat_all['date'] = _pd.to_datetime(feat_all['date'], errors='coerce')
+                        feat_all = feat_all.sort_values(['ticker','date']).drop_duplicates(subset=['ticker'], keep='last')
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # INNER JOIN exact ensemble set with features and strictly preserve ensemble order
+            try:
+                df_to_display = ens_top.merge(
+                    feat_all.drop(columns=['ensemble_score'], errors='ignore'),
+                    on='ticker', how='inner'
+                ).sort_values('ensemble_rank')
+                # Lock order by setting index
+                try:
+                    df_to_display = df_to_display.set_index('ensemble_rank', drop=False)
+                except Exception:
+                    pass
+            except Exception:
+                # Fallback: left join
+                df_to_display = ens_top.merge(
+                    feat_all.drop(columns=['ensemble_score'], errors='ignore'),
+                    on='ticker', how='left'
+                ).sort_values('ensemble_rank')
+                try:
+                    df_to_display = df_to_display.set_index('ensemble_rank', drop=False)
+                except Exception:
+                    pass
+
+            # Debug: show orders UI is using vs ensemble
+            try:
+                st.caption("Ensemble source: data/top/ensemble_scores_output.csv")
+                st.text("Ensemble top 10: " + ", ".join(ens_top['ticker'].head(10).tolist()))
+                st.text("Displayed top 10: " + ", ".join(df_to_display['ticker'].head(10).tolist()))
+            except Exception:
+                pass
     except Exception:
         pass
     
-    # Format numeric columns
-    if 'close' in df_to_display.columns:
-        df_to_display['close'] = df_to_display['close'].apply(lambda x: f"${x:.2f}")
-    if 'predicted_change' in df_to_display.columns:
-        df_to_display['predicted_change'] = df_to_display['predicted_change'].apply(lambda x: f"${x:+.2f}")
-    if 'predicted_return_pct' in df_to_display.columns:
-        df_to_display['predicted_return_pct'] = df_to_display['predicted_return_pct'].apply(lambda x: f"{x:+.2f}%")
-    if 'xgb_predicted_return_pct' in df_to_display.columns:
-        df_to_display['xgb_predicted_return_pct'] = df_to_display['xgb_predicted_return_pct'].apply(lambda x: f"{x:+.2f}%")
-    if 'lstm_predicted_return_pct' in df_to_display.columns:
-        df_to_display['lstm_predicted_return_pct'] = df_to_display['lstm_predicted_return_pct'].apply(lambda x: f"{x:+.2f}%")
-    if 'ensemble_score' in df_to_display.columns:
-        df_to_display['ensemble_score'] = df_to_display['ensemble_score'].apply(lambda x: f"{x:+.3f}")
-    if 'confidence_score' in df_to_display.columns:
-        df_to_display['confidence_score'] = df_to_display['confidence_score'].apply(lambda x: f"{x:.1f}")
-    if 'xgb_confidence_score' in df_to_display.columns:
-        df_to_display['xgb_confidence_score'] = df_to_display['xgb_confidence_score'].apply(lambda x: f"{x:.1f}")
-    if 'risk_score' in df_to_display.columns:
-        df_to_display['risk_score'] = df_to_display['risk_score'].apply(lambda x: f"{x:.1f}")
-    if 'composite_score' in df_to_display.columns:
-        df_to_display['composite_score'] = df_to_display['composite_score'].apply(lambda x: f"{x:.1f}")
+    # Enforce final ordering strictly by ensemble_rank if present; otherwise fall back
+    try:
+        if 'ensemble_rank' in df_to_display.columns:
+            df_to_display = df_to_display.sort_values('ensemble_rank')
+            try:
+                df_to_display = df_to_display.set_index('ensemble_rank', drop=False)
+            except Exception:
+                pass
+        elif 'ensemble_score' in df_to_display.columns:
+            df_to_display['__ens__'] = pd.to_numeric(df_to_display['ensemble_score'], errors='coerce')
+            df_to_display = df_to_display.sort_values('__ens__', ascending=False, na_position='last').drop(columns=['__ens__'])
+        elif 'composite_score' in st.session_state.top_stocks_df.columns:
+            order = st.session_state.top_stocks_df.sort_values('composite_score', ascending=False)['ticker'].astype(str).str.upper().tolist()
+            df_to_display['__order__'] = pd.Categorical(df_to_display['ticker'].astype(str).str.upper(), categories=order, ordered=True)
+            df_to_display = df_to_display.sort_values('__order__').drop(columns=['__order__'])
+    except Exception:
+        pass
     
+    # Format numeric columns (only if present and numeric)
+    if 'close' in df_to_display.columns:
+        # Keep close numeric for downstream computations; format only at display-time where needed
+        df_to_display['close'] = pd.to_numeric(df_to_display['close'].astype(str).str.replace(r'[^0-9.+-]','', regex=True), errors='coerce')
+    for col in ['predicted_change','predicted_return_pct','xgb_predicted_return_pct','lstm_predicted_return_pct','ensemble_score','confidence_score','xgb_confidence_score','risk_score','composite_score']:
+        if col in df_to_display.columns:
+            if col in ['predicted_change']:
+                df_to_display[col] = df_to_display[col].apply(lambda x: f"${float(x):+.2f}" if pd.notna(pd.to_numeric(str(x).replace('$',''), errors='coerce')) else str(x))
+            elif col in ['ensemble_score']:
+                df_to_display[col] = df_to_display[col].apply(lambda x: f"{float(x):+.3f}" if pd.notna(pd.to_numeric(str(x), errors='coerce')) else str(x))
+            elif col.endswith('_predicted_return_pct') or col == 'predicted_return_pct':
+                df_to_display[col] = df_to_display[col].apply(lambda x: f"{float(str(x).replace('%','')):+.2f}%" if pd.notna(pd.to_numeric(str(x).replace('%',''), errors='coerce')) else str(x))
+            elif col.endswith('confidence_score'):
+                df_to_display[col] = df_to_display[col].apply(lambda x: f"{float(x):.1f}" if pd.notna(pd.to_numeric(str(x), errors='coerce')) else str(x))
+            elif col == 'risk_score' or col == 'composite_score':
+                df_to_display[col] = df_to_display[col].apply(lambda x: f"{float(x):.1f}" if pd.notna(pd.to_numeric(str(x), errors='coerce')) else str(x))
+
     # Highlight rows also present in Momentum page (green background)
     try:
         momentum_path = os.getenv('FEATURED_STOCKS_MOMENTUM_CSV', 'data/momentum/featured_stocks_momentum.csv')
@@ -1587,7 +2061,12 @@ if not st.session_state.top_stocks_df.empty:
     col1, col2 = st.columns(2)
     
     with col1:
-        csv = st.session_state.top_stocks_df.to_csv(index=False)
+        # Export the currently displayed (ensemble-ordered) table
+        try:
+            export_df = df_to_display.copy()
+        except Exception:
+            export_df = st.session_state.top_stocks_df.copy()
+        csv = export_df.to_csv(index=False)
         st.download_button(
             label="📥 Download as CSV",
             data=csv,
@@ -1596,19 +2075,44 @@ if not st.session_state.top_stocks_df.empty:
         )
     
     with col2:
-        # Portfolio summary
+        # Portfolio summary (robust to formatted strings like "+0.64%")
+        def _num(series):
+            import pandas as _pd
+            if series is None:
+                return _pd.Series([], dtype=float)
+            return _pd.to_numeric(_pd.Series(series).astype(str).str.replace(r'[^0-9.+-]+','', regex=True), errors='coerce')
+
+        avg_return_val = _num(export_df.get('predicted_return_pct')).mean()
+        avg_conf_val = _num(export_df.get('confidence_score')).mean()
+        avg_risk_val = _num(export_df.get('risk_score')).mean()
+
         summary = f"""
 Portfolio Summary - Generated on {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
 
-Total Stocks: {len(st.session_state.top_stocks_df)}
-Average Predicted Return: {st.session_state.top_stocks_df['predicted_return_pct'].mean():.2f}%
-Average Confidence Score: {st.session_state.top_stocks_df['confidence_score'].mean():.1f}
-Average Risk Score: {st.session_state.top_stocks_df['risk_score'].mean():.1f}
+Total Stocks: {len(export_df)}
+Average Predicted Return: {0.0 if pd.isna(avg_return_val) else avg_return_val:.2f}%
+Average Confidence Score: {0.0 if pd.isna(avg_conf_val) else avg_conf_val:.1f}
+Average Risk Score: {0.0 if pd.isna(avg_risk_val) else avg_risk_val:.1f}
 
 Top 5 Picks:
 """
-        for i, (_, stock) in enumerate(st.session_state.top_stocks_df.head().iterrows(), 1):
-            summary += f"{i}. {stock['ticker']}: {stock['predicted_return_pct']:.2f}% return, {stock['confidence_score']:.1f} confidence\n"
+        for i, (_, stock) in enumerate(export_df.head().iterrows(), 1):
+            pr = str(stock.get('predicted_return_pct',''))
+            cs = str(stock.get('confidence_score',''))
+            # Strip symbols and coerce
+            try:
+                import re
+                pr_val = float(re.sub(r"[^0-9.+-]", "", pr)) if pr != '' else float('nan')
+            except Exception:
+                pr_val = float('nan')
+            try:
+                import re
+                cs_val = float(re.sub(r"[^0-9.+-]", "", cs)) if cs != '' else float('nan')
+            except Exception:
+                cs_val = float('nan')
+            pr_txt = f"{pr_val:.2f}%" if pr_val == pr_val else str(pr)
+            cs_txt = f"{cs_val:.1f}" if cs_val == cs_val else str(cs)
+            summary += f"{i}. {stock.get('ticker','')}: {pr_txt} return, {cs_txt} confidence\n"
         
         st.download_button(
             label="📄 Download Summary",
