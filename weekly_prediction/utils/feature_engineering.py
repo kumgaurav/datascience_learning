@@ -114,13 +114,22 @@ def _compute_features(
     # Moving averages and volatility
     df['ma_20'] = g_close.rolling(window=20, min_periods=20).mean().reset_index(level=0, drop=True)
     df['ma_50'] = g_close.rolling(window=50, min_periods=50).mean().reset_index(level=0, drop=True)
+    # Additional close MA/STD windows used by models
+    df['close_ma_5d'] = g_close.rolling(window=5, min_periods=5).mean().reset_index(level=0, drop=True)
+    df['close_std_5d'] = g_close.rolling(window=5, min_periods=5).std().reset_index(level=0, drop=True)
+    df['close_ma_20d'] = g_close.rolling(window=20, min_periods=20).mean().reset_index(level=0, drop=True)
+    df['close_std_20d'] = g_close.rolling(window=20, min_periods=20).std().reset_index(level=0, drop=True)
     df['return_1d'] = g_close.pct_change()
-    df['volatility_30d'] = (
-        df.groupby('ticker')['return_1d']
-        .rolling(window=30, min_periods=30)
-        .std()
-        .reset_index(level=0, drop=True)
-    )
+    # Returns over multiple horizons
+    df['return_3d'] = g_close.pct_change(periods=3)
+    df['return_5d'] = g_close.pct_change(periods=5)
+    df['return_10d'] = g_close.pct_change(periods=10)
+    df['return_20d'] = g_close.pct_change(periods=20)
+    # Volatility windows
+    ret_grp = df.groupby('ticker')['return_1d']
+    df['volatility_5d'] = ret_grp.rolling(window=5, min_periods=5).std().reset_index(level=0, drop=True)
+    df['volatility_20d'] = ret_grp.rolling(window=20, min_periods=20).std().reset_index(level=0, drop=True)
+    df['volatility_30d'] = ret_grp.rolling(window=30, min_periods=30).std().reset_index(level=0, drop=True)
 
     # RSI
     df['rsi_14d'] = g_close.apply(lambda s: rsi(s, rsi_period))
@@ -261,6 +270,43 @@ def _compute_features(
         df['volume_zscore_20'] = (df['volume'] - vol_mean_20) / vol_std_20
     df['volume_spike'] = df['volume_zscore_20'] > 2.0
 
+    # Per-date z-scores for selected features (cross-sectional standardization)
+    def _z_by_date(frame: pd.DataFrame, col: str, out_col: str) -> None:
+        if col not in frame.columns:
+            frame[out_col] = np.nan
+            return
+        grp = frame.groupby('date')[col]
+        mean = grp.transform('mean')
+        std = grp.transform('std').replace(0, np.nan)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            frame[out_col] = (frame[col] - mean) / std
+
+    _z_by_date(df, 'volume', 'volume_z')
+    _z_by_date(df, 'volatility_20d', 'volatility_20d_z')
+    _z_by_date(df, 'close_std_20d', 'close_std_20d_z')
+    _z_by_date(df, 'volume_ratio', 'volume_ratio_z')
+
+    # Interaction term used by model
+    try:
+        if 'momentum_20d' in df.columns and 'volume_ratio' in df.columns:
+            df['mom20_x_volratio'] = df['momentum_20d'] * df['volume_ratio']
+        else:
+            df['mom20_x_volratio'] = np.nan
+    except Exception:
+        df['mom20_x_volratio'] = np.nan
+
+    # SPY daily return if available (broadcast by date), else 0.0
+    try:
+        spy_mask = df['ticker'].astype(str).str.upper() == 'SPY'
+        if spy_mask.any():
+            spy = df.loc[spy_mask, ['date', 'return_1d']].dropna().rename(columns={'return_1d': 'spy_return_1d'})
+            df = df.merge(spy, on='date', how='left')
+            df['spy_return_1d'] = df['spy_return_1d'].fillna(0.0)
+        else:
+            df['spy_return_1d'] = 0.0
+    except Exception:
+        df['spy_return_1d'] = 0.0
+
     # Gap analysis
     prev_close_flat = prev_close.reset_index(level=0, drop=True)
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -308,7 +354,8 @@ def _compute_features(
     # Column ordering similar to the rich feature set
     preferred_cols = [
         'ticker', 'date', 'open', 'high', 'low', 'close', 'volume',
-        'ma_20', 'ma_50', 'volatility_30d', 'rsi_14d',
+        'ma_20', 'ma_50', 'close_ma_5d', 'close_std_5d', 'close_ma_20d', 'close_std_20d',
+        'volatility_5d', 'volatility_20d', 'volatility_30d', 'rsi_14d',
         'macd', 'macd_signal', 'macd_histogram',
         'bb_upper', 'bb_middle', 'bb_lower', 'bb_position',
         'volume_ma_20', 'volume_ratio', 'pvt', 'obv',
@@ -319,7 +366,9 @@ def _compute_features(
         'price_change_pct', 'vol_change_pct', 'rsi_price_interaction', 'volratio_price_interaction',
         'selloff_flag', 'overbought_spike', 'prev50d_high', 'broke_resistance', 'days_since_last_broke_resistance',
         'volume_zscore_20', 'volume_spike', 'gap_pct', 'gap_up_2pct', 'gap_down_2pct',
-        'relative_strength_20d', 'vol_adj_momentum_20d'
+        'relative_strength_20d', 'vol_adj_momentum_20d',
+        'return_1d', 'return_3d', 'return_5d', 'return_10d', 'return_20d',
+        'spy_return_1d', 'volume_z', 'volatility_20d_z', 'close_std_20d_z', 'volume_ratio_z', 'mom20_x_volratio'
     ]
     existing = [c for c in preferred_cols if c in out_all.columns]
     return out_all[existing]

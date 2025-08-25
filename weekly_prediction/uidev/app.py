@@ -800,8 +800,11 @@ if not st.session_state.top_stocks_df.empty:
 
                 # Get predicted return and confidence data from filtered stocks if available (robust columns)
                 if not st.session_state.top_stocks_df.empty:
-                    filtered_stock_data = st.session_state.top_stocks_df[st.session_state.top_stocks_df['ticker'] == selected_ticker]
+                    filtered_stock_data = st.session_state.top_stocks_df.loc[st.session_state.top_stocks_df['ticker'] == selected_ticker].copy()
                     if not filtered_stock_data.empty:
+                        # Ensure we are writing to a safe, independent object
+                        if isinstance(stock_featured_data, (pd.DataFrame, pd.Series)):
+                            stock_featured_data = stock_featured_data.copy()
                         filtered_row = filtered_stock_data.iloc[0]
                         # Predicted return: prefer combined/xgb/lstm
                         _pred_candidates = [
@@ -834,7 +837,7 @@ if not st.session_state.top_stocks_df.empty:
                 st.success(f"✅ Complete technical data loaded for {selected_ticker}")
             except Exception as e:
                 # Fallback to filtered data if complete data not available
-                stock_featured_data = st.session_state.top_stocks_df[st.session_state.top_stocks_df['ticker'] == selected_ticker].iloc[0]
+                stock_featured_data = st.session_state.top_stocks_df.loc[st.session_state.top_stocks_df['ticker'] == selected_ticker].iloc[0].copy()
                 st.warning(f"⚠️ Using filtered data for {selected_ticker} (some technical indicators may be missing)")
             
             # Create tabs for different chart views
@@ -1406,11 +1409,11 @@ if not st.session_state.top_stocks_df.empty:
                             _rename[_lower_map[src]] = dst
                     if _rename:
                         earnings_data = earnings_data.rename(columns=_rename)
-                    earnings_ticker_data = earnings_data[earnings_data['ticker'] == selected_ticker]
+                    earnings_ticker_data = earnings_data.loc[earnings_data['ticker'] == selected_ticker].copy()
                     
                     if not earnings_ticker_data.empty:
                         # Convert earnings_date to datetime
-                        earnings_ticker_data['earnings_date'] = pd.to_datetime(earnings_ticker_data['earnings_date'])
+                        earnings_ticker_data.loc[:, 'earnings_date'] = pd.to_datetime(earnings_ticker_data['earnings_date'], errors='coerce')
                         
                         # Sort by date (most recent first)
                         earnings_ticker_data = earnings_ticker_data.sort_values('earnings_date', ascending=False)

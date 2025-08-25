@@ -81,3 +81,16 @@ def default_sort(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(nums[0], ascending=False) if nums else df
 
 
+
+@st.cache_data(show_spinner=False)
+def load_momentum_weekly() -> pd.DataFrame:
+    """Load momentum weekly CSV from data/momentum/momentum_weekly_output.csv.
+
+    Returns empty DataFrame if not present.
+    """
+    csv_path = os.path.join(BASE_DIR, "data", "momentum", "momentum_weekly_output.csv")
+    df = _read_csv_if_exists(csv_path)
+    if 'ticker' in df.columns:
+        df['ticker'] = df['ticker'].astype(str).str.upper()
+    return df
+
