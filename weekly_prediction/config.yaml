@@ -68,6 +68,12 @@ paths:
   xgb_out: data/xgboost/xgboost_weekly_output.csv
   lstm_out: data/lstm/lstm_weekly_output.csv
   ensemble_out: data/ensemble/ensemble_weekly_output.csv
+  momentum_out: data/momentum/momentum_weekly_output.csv
   earnings_history: data/input/earnings_history.csv
+
+
+momentum:
+  model_path: models/momentum/stock_predictor_momentum.joblib
+  features_path: data/features/stock_features_clean.csv
 
 
