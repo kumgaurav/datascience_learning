@@ -1,0 +1,25 @@
+logging:
+  level: INFO
+  file: logs/snapshot.log
+
+paths:
+  # Inputs
+  features_csv: data/features/stock_features_clean.csv
+  predictions_csv: data/ensemble/ensemble_weekly_output.csv
+  prices_csv: data/input/stock_prices_with_clean_data.csv
+  # Optional ranked-first construction inputs
+  xgb_ranked_csv: data/xgboost/xgboost_weekly_output.csv
+  xgb_ranked_output_csv: data/xgboost/xgboost_weekly_output.csv
+  xgb_weekly_output_csv: data/xgboost/xgboost_weekly_output.csv
+  # Outputs
+  snapshot_root_dir: snapshot
+
+# Optional model paths for metadata and downstream tools
+xgboost:
+  model_path: models/stock_predictor_top.joblib
+
+lstm:
+  model_path: models/lstm/lib/keras/lstm_model.keras
+  meta_path: models/lstm/json/lstm_model_meta.json
+
+
