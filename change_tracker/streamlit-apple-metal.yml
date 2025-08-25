@@ -1,0 +1,21 @@
+name: streamlit-arrow
+channels:
+  - apple
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - streamlit=1.37.1
+  - pandas=2.2.3
+  - numpy=1.26.4
+  - pyarrow=16.1.0
+  - plotly=5.22.0
+  - scikit-learn=1.4.2
+  - matplotlib=3.8.4
+  - seaborn=0.13.2
+  - pymysql=1.1.0
+  - sqlalchemy=2.0.30
+  - configparser
+  - pip
+  - pip:
+    - deap==1.4.1

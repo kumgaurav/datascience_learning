@@ -11,6 +11,9 @@ dependencies:
   - matplotlib
   - scikit-learn
   - xgboost
+  - shap
+  - streamlit
+  - python-dotenv
   - jupyterlab
   - sqlalchemy
   - joblib
@@ -21,6 +24,7 @@ dependencies:
   - pyyaml
   - pytest
   - pip
+  - deap
   - pip:
       - tensorflow-macos
       - tensorflow-metal
